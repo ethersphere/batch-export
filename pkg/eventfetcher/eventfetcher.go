@@ -27,7 +27,6 @@ type Client struct {
 	batchTopUpTopic         common.Hash
 	batchDepthIncreaseTopic common.Hash
 	priceUpdateTopic        common.Hash
-	pausedTopic             common.Hash
 }
 
 func NewClient(client *ethclientwrapper.Client, postageStampContractABI abi.ABI, blockRangeLimit uint32, logger log.Logger) *Client {
@@ -51,6 +50,10 @@ type Request struct {
 	EndBlock   uint64
 }
 
+func (c *Client) GetStats() logcache.Stats {
+	return c.logCache.GetStats()
+}
+
 // GetLogs fetches logs and sends them to a channel
 func (c *Client) GetLogs(ctx context.Context, tr *Request) (<-chan types.Log, <-chan error) {
 	logChan := make(chan types.Log, 100)
@@ -61,7 +64,7 @@ func (c *Client) GetLogs(ctx context.Context, tr *Request) (<-chan types.Log, <-
 		defer close(errorChan)
 		// send the last cached value to the channel
 		// defer func() {
-		// 	priceUpdateLog := c.logCache.Get()
+		// 	priceUpdateLog := c.logCache.GetLastPriceUpdateLog()
 		// 	if priceUpdateLog != nil {
 		// 		c.logger.Info("sending last cached value", "transactionHash", priceUpdateLog.TxHash)
 		// 		logChan <- *priceUpdateLog
@@ -136,11 +139,22 @@ func (c *Client) fetchLogs(ctx context.Context, query ethereum.FilterQuery, logs
 		}
 
 		for _, log := range logs {
-			// cache the price update log and skip sending it to the channel
-			// if log.Topics[0] == c.priceUpdateTopic {
-			// 	c.logCache.Set(&log)
+			var isPriceUpdate, isBatchCreated, isBatchTopUp, isBatchDepthIncrease bool
+			if len(log.Topics) > 0 {
+				topic := log.Topics[0]
+				isPriceUpdate = topic == c.priceUpdateTopic
+				isBatchCreated = topic == c.batchCreatedTopic
+				isBatchTopUp = topic == c.batchTopUpTopic
+				isBatchDepthIncrease = topic == c.batchDepthIncreaseTopic
+			}
+
+			c.logCache.ProcessLogAndStats(log, isPriceUpdate, isBatchCreated, isBatchTopUp, isBatchDepthIncrease)
+
+			// skip sending it to the channel
+			// if isPriceUpdate {
 			// 	continue
 			// }
+
 			select {
 			case logsChan <- log:
 			case <-ctx.Done():
@@ -173,7 +187,6 @@ func (c *Client) filterQuery(postageStampContractAddress common.Address, from, t
 				c.batchTopUpTopic,
 				c.batchDepthIncreaseTopic,
 				c.priceUpdateTopic,
-				c.pausedTopic,
 			},
 		},
 	}

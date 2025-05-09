@@ -34,3 +34,19 @@ func SaveLogsAsync(ctx context.Context, logChan <-chan types.Log, filePath strin
 		}
 	}
 }
+
+func SaveLogsJSON(data any, filePath string) error {
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("error creating file: %w", err)
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(data); err != nil {
+		return fmt.Errorf("error encoding data: %w", err)
+	}
+
+	return nil
+}

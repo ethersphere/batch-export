@@ -7,12 +7,12 @@ import (
 	"github.com/ethersphere/batch-export/pkg/logcache"
 )
 
-func TestBasic(t *testing.T) {
+func TestGetLastPriceUpdateLog(t *testing.T) {
 	t.Parallel()
 	c := logcache.New()
-	b := &types.Log{}
-	c.Set(b)
-	if c.Get() == nil {
+	b := types.Log{}
+	c.ProcessLogAndStats(b, true, false, false, false)
+	if c.GetLastPriceUpdateLog() == nil {
 		t.Fatal("expected block to be cached")
 	}
 }
