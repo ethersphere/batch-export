@@ -59,13 +59,14 @@ func (c *Client) GetLogs(ctx context.Context, tr *Request) (<-chan types.Log, <-
 	go func() {
 		defer close(logChan)
 		defer close(errorChan)
-		defer func() {
-			priceUpdateLog := c.logCache.Get()
-			if priceUpdateLog != nil {
-				c.logger.Info("sending last cached value", "transactionHash", priceUpdateLog.TxHash)
-				logChan <- *priceUpdateLog
-			}
-		}()
+		// send the last cached value to the channel
+		// defer func() {
+		// 	priceUpdateLog := c.logCache.Get()
+		// 	if priceUpdateLog != nil {
+		// 		c.logger.Info("sending last cached value", "transactionHash", priceUpdateLog.TxHash)
+		// 		logChan <- *priceUpdateLog
+		// 	}
+		// }()
 
 		if err := c.validate.Struct(tr); err != nil {
 			errorChan <- fmt.Errorf("error validating request: %w", err)
@@ -135,10 +136,11 @@ func (c *Client) fetchLogs(ctx context.Context, query ethereum.FilterQuery, logs
 		}
 
 		for _, log := range logs {
-			if log.Topics[0] == c.priceUpdateTopic {
-				c.logCache.Set(&log)
-				continue
-			}
+			// cache the price update log and skip sending it to the channel
+			// if log.Topics[0] == c.priceUpdateTopic {
+			// 	c.logCache.Set(&log)
+			// 	continue
+			// }
 			select {
 			case logsChan <- log:
 			case <-ctx.Done():
