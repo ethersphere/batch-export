@@ -134,7 +134,7 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 
 	cmd.Flags().Uint64VarP(&startBlock, "start", "", 31306381, "Start block (optional, uses contract start block if 0)")
 	cmd.Flags().Uint64VarP(&endBlock, "end", "", 0, "End block (optional, uses latest block if 0)")
-	cmd.Flags().StringVarP(&rpcEndpoint, "endpoint", "e", "https://wandering-evocative-gas.xdai.quiknode.pro/0f2525676e3ba76259ab3b72243f7f60334b0000/", "Ethereum RPC endpoint URL")
+	cmd.Flags().StringVarP(&rpcEndpoint, "endpoint", "e", "https://rpc.gnosis.gateway.fm", "Ethereum based RPC endpoint URL")
 	cmd.Flags().IntVarP(&maxRequest, "max-request", "m", 15, "Max RPC requests/sec")
 	cmd.Flags().Uint32VarP(&blockRangeLimit, "block-range-limit", "b", 5, "Max blocks per log query")
 	cmd.Flags().StringVarP(&outputFile, "output", "o", "export.ndjson", "Output file path (NDJSON)")
