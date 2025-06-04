@@ -11,14 +11,20 @@ DOMAIN2=$2
 FILE1="1.txt"
 FILE2="2.txt"
 
-# Perform curl requests and save output to files
-curl -s "http://${DOMAIN1}/batches" | jq > "$FILE1"
+# Perform curl requests in parallel
+curl -s "http://${DOMAIN1}/batches" | jq > "$FILE1" &
+PID1=$!
+curl -s "http://${DOMAIN2}/batches" | jq > "$FILE2" &
+PID2=$!
+
+# Wait for both curl commands to complete
+wait $PID1
 if [ $? -ne 0 ]; then
     echo "Error fetching data from ${DOMAIN1}"
     exit 1
 fi
 
-curl -s "http://${DOMAIN2}/batches" | jq > "$FILE2"
+wait $PID2
 if [ $? -ne 0 ]; then
     echo "Error fetching data from ${DOMAIN2}"
     exit 1
