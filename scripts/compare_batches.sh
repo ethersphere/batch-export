@@ -58,8 +58,8 @@ jq '.batches | map(del(.batchTTL))' "$TMP2" > "$FILE2"
 # Compare the files and show differences side by side
 echo "Differences between ${FILE1} and ${FILE2} (side by side):"
 if diff --side-by-side --suppress-common-lines "$FILE1" "$FILE2"; then
-    echo "No differences found. Cleaning up..."
-    rm -f "$FILE1" "$FILE2" "$TMP1" "$TMP2"
+    echo "No differences found."
+    rm -f "$TMP1" "$TMP2"
 else
     echo "Differences found (see above)."
 fi
