@@ -62,4 +62,5 @@ if diff --side-by-side --suppress-common-lines "$FILE1" "$FILE2"; then
     rm -f "$TMP1" "$TMP2"
 else
     echo "Differences found (see above)."
+    exit 1
 fi
