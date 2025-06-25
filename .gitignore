@@ -24,3 +24,8 @@ go.work.sum
 # Folders
 dist/
 .vscode/
+
+**/1.txt
+**/2.txt
+**/tmp1.json
+**/tmp2.json

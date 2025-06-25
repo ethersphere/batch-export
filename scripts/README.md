@@ -7,11 +7,13 @@ This directory contains the `compare_batches.sh` script for comparing batch data
 To use the `compare_batches.sh` script:
 
 1. Make the script executable:
+
    ```bash
    chmod +x compare_batches.sh
    ```
 
 2. Run it with two domain names:
+
    ```bash
    ./compare_batches.sh localhost:1633 other_domain
    ```
@@ -32,3 +34,12 @@ The `compare_batches.sh` script:
 ## Output
 
 The script will display differences between the two batch endpoints side by side, or report "No differences found" if the responses are identical.
+
+## Build & Push
+
+To build and push the Docker image for this script, you can use the following commands:
+
+```bash
+docker build -t your_dockerhub_username/compare_batches.sh:latest .
+docker push your_dockerhub_username/compare_batches.sh:latest
+```
