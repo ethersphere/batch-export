@@ -33,9 +33,10 @@ The primary command is export.
 
 ```sh
 ./dist/batch-export export \
-    --start 31306381 \
-    --endpoint <YOUR_GNOSIS_RPC_ENDPOINT> \
-    --output my_logs.ndjson
+    --block-range-limit=10000 \
+    --compress=true \
+    --end=0 \
+    --endpoint <YOUR_GNOSIS_RPC_ENDPOINT>
 ```
 
 ## Flags
