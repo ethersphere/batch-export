@@ -8,6 +8,7 @@ batch-export is a tool to retrieve Ethereum event logs for specific contracts, p
 - Handles large block ranges by querying in smaller chunks.
 - Supports rate limiting for RPC requests.
 - Saves retrieved logs to a specified output file (default: `export.ndjson`) in NDJSON format.
+- Supports file compression using **Gzip**, **Zstd**, or **Xz** (LZMA2).
 - Graceful shutdown on interrupt signals (Ctrl+C).
 
 ## Requirements
@@ -34,7 +35,7 @@ The primary command is export.
 ```sh
 ./dist/batch-export export \
     --block-range-limit=10000 \
-    --compress=true \
+    --compression-algo=zstd \
     --end=0 \
     --endpoint <YOUR_GNOSIS_RPC_ENDPOINT>
 ```
@@ -43,7 +44,8 @@ The primary command is export.
 
 ```sh
   -b, --block-range-limit uint32   Max blocks per log query (default 5)
-  -c, --compress                   Compress to GZIP
+  -c, --compress                   Compress to GZIP (deprecated, use --compression-algo)
+      --compression-algo string    Compression algorithm (gzip, zstd, xz, none) (default "gzip")
       --end uint                   End block (optional, uses latest block if 0) (default 39810670)
   -e, --endpoint string            Ethereum RPC endpoint URL
   -h, --help                       help for export

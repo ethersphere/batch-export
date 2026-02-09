@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethersphere/batch-export/pkg/compressor"
 	ethclient "github.com/ethersphere/batch-export/pkg/ethclientwrapper"
 	"github.com/ethersphere/batch-export/pkg/eventfetcher"
 	"github.com/ethersphere/batch-export/pkg/filestore"
-	"github.com/ethersphere/batch-export/pkg/gzipstore"
 	"github.com/ethersphere/bee/v2/pkg/config"
 	"github.com/ethersphere/bee/v2/pkg/util/abiutil"
 	"github.com/spf13/cobra"
@@ -91,12 +91,32 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 			}()
 
 			compressFunc := func() error {
+				algo, _ := cmd.Flags().GetString("compression-algo")
 				if compress {
-					if err := gzipstore.CompressFile(outputFile, outputFile+".gzip"); err != nil {
-						return fmt.Errorf("error compressing file: %w", err)
-					}
-					c.log.Info("File compressed", "outputFile", outputFile+".gzip")
+					algo = "gzip" // backward compatibility
 				}
+
+				if algo == "none" {
+					return nil
+				}
+
+				outputExt := ""
+				switch algo {
+				case "gzip":
+					outputExt = ".gzip"
+				case "zstd":
+					outputExt = ".zst"
+				case "xz":
+					outputExt = ".xz"
+				default:
+					return fmt.Errorf("unsupported compression algorithm: %s", algo)
+				}
+
+				compressedFile := outputFile + outputExt
+				if err := compressor.CompressFile(outputFile, compressedFile, algo); err != nil {
+					return fmt.Errorf("error compressing file: %w", err)
+				}
+				c.log.Info("File compressed", "outputFile", compressedFile)
 				return nil
 			}
 
@@ -138,7 +158,8 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 	cmd.Flags().IntVarP(&maxRequest, "max-request", "m", 15, "Max RPC requests/sec")
 	cmd.Flags().Uint32VarP(&blockRangeLimit, "block-range-limit", "b", 5, "Max blocks per log query")
 	cmd.Flags().StringVarP(&outputFile, "output", "o", "export.ndjson", "Output file path (NDJSON)")
-	cmd.Flags().BoolVarP(&compress, "compress", "c", false, "Compress to GZIP")
+	cmd.Flags().BoolVarP(&compress, "compress", "c", false, "Compress to GZIP (deprecated, use --compression-algo)")
+	cmd.Flags().String("compression-algo", "gzip", "Compression algorithm (gzip, zstd, xz, none)")
 
 	c.root.AddCommand(cmd)
 
