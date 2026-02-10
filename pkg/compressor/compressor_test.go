@@ -21,7 +21,7 @@ func TestCompressionSizes(t *testing.T) {
 	}
 
 	inputFile := "test_input.json"
-	err := os.WriteFile(inputFile, inputContent, 0644)
+	err := os.WriteFile(inputFile, inputContent, 0o644)
 	assert.NoError(t, err)
 	defer os.Remove(inputFile)
 
