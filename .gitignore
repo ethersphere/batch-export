@@ -29,3 +29,5 @@ dist/
 **/2.txt
 **/tmp1.json
 **/tmp2.json
+
+.DS_Store
