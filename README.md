@@ -52,3 +52,9 @@ The primary command is export.
       --start uint                 Start block (optional, uses contract start block if 0) (default 31306381)
   -v, --verbosity string           Log verbosity (silent, error, warn, info, debug) (default "info")
 ```
+
+The produced NDJSON is consumed by [batch-archive](https://github.com/ethersphere/batch-archive), which embeds it for use inside Bee.
+
+## Maintainers
+
+- [Bee](https://github.com/orgs/ethersphere/teams/bee) team
