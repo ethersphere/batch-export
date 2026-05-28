@@ -25,6 +25,7 @@ func (c *command) initExportCmd() (err error) {
 		blockRangeLimit uint32
 		outputFile      string
 		compress        bool
+		slim            bool
 	)
 
 	cmd := &cobra.Command{
@@ -79,7 +80,7 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 
 			go func() {
 				defer wg.Done()
-				if err := filestore.SaveLogsAsync(ctx, logChan, outputFile); err != nil {
+				if err := filestore.SaveLogsAsync(ctx, logChan, outputFile, slim); err != nil {
 					if errors.Is(err, context.Canceled) {
 						c.log.Error(err, "context canceled while saving logs")
 						return
@@ -139,6 +140,7 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 	cmd.Flags().Uint32VarP(&blockRangeLimit, "block-range-limit", "b", 5, "Max blocks per log query")
 	cmd.Flags().StringVarP(&outputFile, "output", "o", "export.ndjson", "Output file path (NDJSON)")
 	cmd.Flags().BoolVarP(&compress, "compress", "c", false, "Compress to GZIP")
+	cmd.Flags().BoolVar(&slim, "slim", true, "Emit only the types.Log fields Bee consumes (address, topics, data, blockNumber, transactionHash); set false for full geth shape")
 
 	c.root.AddCommand(cmd)
 

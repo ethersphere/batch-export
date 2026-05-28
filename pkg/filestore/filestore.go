@@ -6,11 +6,36 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
+// slimLog mirrors the subset of geth's types.Log that Bee's snapshot consumer reads.
+// Field order, JSON tags, and hex value shapes match geth's generated MarshalJSON,
+// so slim and full snapshots are interchangeable on the Bee side.
+type slimLog struct {
+	Address     common.Address `json:"address"`
+	Topics      []common.Hash  `json:"topics"`
+	Data        hexutil.Bytes  `json:"data"`
+	BlockNumber hexutil.Uint64 `json:"blockNumber"`
+	TxHash      common.Hash    `json:"transactionHash"`
+}
+
+func newSlimLog(l types.Log) slimLog {
+	return slimLog{
+		Address:     l.Address,
+		Topics:      l.Topics,
+		Data:        l.Data,
+		BlockNumber: hexutil.Uint64(l.BlockNumber),
+		TxHash:      l.TxHash,
+	}
+}
+
 // SaveLogsAsync writes logs to a file asynchronously.
-func SaveLogsAsync(ctx context.Context, logChan <-chan types.Log, filePath string) error {
+// When slim is true, each log is encoded with only the fields Bee consumes;
+// otherwise the full geth types.Log JSON shape is emitted.
+func SaveLogsAsync(ctx context.Context, logChan <-chan types.Log, filePath string, slim bool) error {
 	file, err := os.Create(filePath)
 	if err != nil {
 		return fmt.Errorf("error creating file: %w", err)
@@ -28,7 +53,12 @@ func SaveLogsAsync(ctx context.Context, logChan <-chan types.Log, filePath strin
 				return nil
 			}
 
-			if err := encoder.Encode(logObj); err != nil {
+			var v any = logObj
+			if slim {
+				v = newSlimLog(logObj)
+			}
+
+			if err := encoder.Encode(v); err != nil {
 				return fmt.Errorf("error encoding log: %w", err)
 			}
 		}
