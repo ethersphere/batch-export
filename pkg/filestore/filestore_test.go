@@ -1,4 +1,4 @@
-package filestore
+package filestore_test
 
 import (
 	"bytes"
@@ -7,6 +7,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethersphere/batch-export/pkg/filestore"
 )
 
 // sampleLog returns a types.Log with every field set to a distinct, non-zero
@@ -39,7 +40,7 @@ func TestSlimMatchesFullForKeptKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal full: %v", err)
 	}
-	slimJSON, err := json.Marshal(newSlimLog(in))
+	slimJSON, err := json.Marshal(filestore.NewSlimLog(in))
 	if err != nil {
 		t.Fatalf("marshal slim: %v", err)
 	}
@@ -74,7 +75,7 @@ func TestSlimMatchesFullForKeptKeys(t *testing.T) {
 func TestSlimRoundTripsThroughGethDecoder(t *testing.T) {
 	in := sampleLog()
 
-	b, err := json.Marshal(newSlimLog(in))
+	b, err := json.Marshal(filestore.NewSlimLog(in))
 	if err != nil {
 		t.Fatalf("marshal slim: %v", err)
 	}

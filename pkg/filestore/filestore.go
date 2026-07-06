@@ -11,10 +11,10 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// slimLog mirrors the subset of geth's types.Log that Bee's snapshot consumer reads.
+// SlimLog mirrors the subset of geth's types.Log that Bee's snapshot consumer reads.
 // Field order, JSON tags, and hex value shapes match geth's generated MarshalJSON,
 // so slim and full snapshots are interchangeable on the Bee side.
-type slimLog struct {
+type SlimLog struct {
 	Address     common.Address `json:"address"`
 	Topics      []common.Hash  `json:"topics"`
 	Data        hexutil.Bytes  `json:"data"`
@@ -22,8 +22,8 @@ type slimLog struct {
 	TxHash      common.Hash    `json:"transactionHash"`
 }
 
-func newSlimLog(l types.Log) slimLog {
-	return slimLog{
+func NewSlimLog(l types.Log) SlimLog {
+	return SlimLog{
 		Address:     l.Address,
 		Topics:      l.Topics,
 		Data:        l.Data,
@@ -55,7 +55,7 @@ func SaveLogsAsync(ctx context.Context, logChan <-chan types.Log, filePath strin
 
 			var v any = logObj
 			if slim {
-				v = newSlimLog(logObj)
+				v = NewSlimLog(logObj)
 			}
 
 			if err := encoder.Encode(v); err != nil {
