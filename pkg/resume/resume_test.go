@@ -14,6 +14,12 @@ import (
 	"github.com/ethersphere/batch-export/pkg/resume"
 )
 
+// windowSize mirrors the unexported constant of the same name in resume.go:
+// how much of a plain NDJSON file lastCursorPlain reads at a time when
+// walking backwards from EOF. Tests use it to construct cases that straddle
+// a window boundary.
+const windowSize = 64 * 1024
+
 // testLog builds a log shaped like the ones the exporter writes. types.Log
 // always marshals blockNumber and logIndex, even at zero.
 func testLog(blockNumber uint64, logIndex uint) types.Log {
@@ -86,6 +92,33 @@ func TestReadCursor(t *testing.T) {
 	// file had been concatenated onto a good export.
 	garbageLines := bytes.Repeat([]byte("not-json\n"), 12*1024)
 
+	// straddle places a single valid log line so that it straddles the
+	// boundary between the last two 64 KiB windows lastCursorPlain reads
+	// backwards from EOF: part of the line falls in the final window, part
+	// falls in the window before it. Reconstructing it requires appending
+	// each newly (re-)read window before the previously carried tail, in
+	// file order — swap that order and the line comes out garbled and
+	// unparseable, which a case where the target line sits wholly inside one
+	// window can never catch.
+	straddleTarget := ndjson(t, testLog(4096, 3))
+	straddlePrefix := bytes.Repeat([]byte("not-json\n"), 4)
+	// afterLen is chosen so that windowSize-many bytes from EOF lands
+	// strictly inside straddleTarget: it is less than windowSize (so the
+	// boundary is not beyond the end of the line) and more than
+	// windowSize-len(straddleTarget) (so the boundary is not before the
+	// line's start).
+	afterLen := windowSize - len(straddleTarget)/2
+	filler := []byte("not-json\n")
+	straddleAfter := bytes.Repeat(filler, afterLen/len(filler)+2)[:afterLen]
+	straddle := append(append(append([]byte{}, straddlePrefix...), straddleTarget...), straddleAfter...)
+
+	straddleLineStart := len(straddlePrefix)
+	straddleLineEnd := len(straddlePrefix) + len(straddleTarget)
+	straddleBoundary := len(straddle) - windowSize
+	if straddleBoundary <= straddleLineStart || straddleBoundary >= straddleLineEnd {
+		t.Fatalf("test setup: boundary %d does not straddle target line [%d, %d)", straddleBoundary, straddleLineStart, straddleLineEnd)
+	}
+
 	tests := []struct {
 		name           string
 		content        []byte
@@ -134,6 +167,12 @@ func TestReadCursor(t *testing.T) {
 			content:   append(append([]byte{}, threeLogs...), garbageLines...),
 			wantBlock: 102,
 			wantIndex: 7,
+		},
+		{
+			name:      "valid line straddles a window boundary",
+			content:   straddle,
+			wantBlock: 4096,
+			wantIndex: 3,
 		},
 		{
 			name:           "gzip",
