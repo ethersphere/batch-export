@@ -11,9 +11,9 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// CreateWriter creates the file at filePath, replacing anything already there,
-// and returns a writer for it. Opening the destination separately lets a
-// caller fail before it starts producing logs it would have nowhere to put.
+// CreateWriter creates the file at filePath, replacing anything already there.
+// It is separate from writing so a caller can fail before it starts producing
+// logs it would have nowhere to put.
 func CreateWriter(filePath string) (io.WriteCloser, error) {
 	file, err := os.Create(filePath)
 	if err != nil {
@@ -46,14 +46,13 @@ func AppendWriter(filePath string) (io.WriteCloser, error) {
 
 // AppendLogsAsync writes logs to w asynchronously, keeping whatever the
 // destination already holds. Logs for which skip reports true are dropped; a
-// nil skip writes every log. The writer is closed before returning, including
-// when the context is cancelled, so a buffered destination is always flushed.
+// nil skip writes every log. w is closed before returning, cancellation
+// included, so a buffered destination is always flushed.
 //
-// The close error is joined into the result rather than discarded: on a
-// compressed destination Close writes the terminator and footer that make the
-// data readable, so a failure there leaves a truncated member behind and must
-// not be reported as a completed save. Joining preserves errors.Is, so a
-// cancelled context still reads as context.Canceled.
+// The close error is joined rather than discarded: on a compressed destination
+// Close writes the terminator and footer, so a failure there leaves a truncated
+// member that must not be reported as a completed save. errors.Join keeps
+// errors.Is working, so a cancelled context still reads as context.Canceled.
 func AppendLogsAsync(ctx context.Context, logChan <-chan types.Log, w io.WriteCloser, skip func(types.Log) bool) (err error) {
 	defer func() { err = errors.Join(err, w.Close()) }()
 

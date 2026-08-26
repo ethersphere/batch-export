@@ -110,21 +110,15 @@ func TestReadCursor(t *testing.T) {
 	// file had been concatenated onto a good export.
 	garbageLines := bytes.Repeat([]byte("not-json\n"), 12*1024)
 
-	// straddle places a single valid log line so that it straddles the
-	// boundary between the last two 64 KiB windows lastCursorPlain reads
-	// backwards from EOF: part of the line falls in the final window, part
-	// falls in the window before it. Reconstructing it requires appending
-	// each newly (re-)read window before the previously carried tail, in
-	// file order — swap that order and the line comes out garbled and
-	// unparseable, which a case where the target line sits wholly inside one
-	// window can never catch.
+	// straddle places a valid log line across the boundary between the last
+	// two windows lastCursorPlain reads: reassembling it requires appending
+	// each re-read window before the carried tail, in file order. Swap that
+	// order and the line comes out garbled — which a case whose target sits
+	// wholly inside one window can never catch.
 	straddleTarget := ndjson(t, testLog(4096, 3))
 	straddlePrefix := bytes.Repeat([]byte("not-json\n"), 4)
-	// afterLen is chosen so that windowSize-many bytes from EOF lands
-	// strictly inside straddleTarget: it is less than windowSize (so the
-	// boundary is not beyond the end of the line) and more than
-	// windowSize-len(straddleTarget) (so the boundary is not before the
-	// line's start).
+	// afterLen puts the boundary (windowSize bytes from EOF) strictly inside
+	// straddleTarget, rather than at a round offset that could drift.
 	afterLen := windowSize - len(straddleTarget)/2
 	filler := []byte("not-json\n")
 	straddleAfter := bytes.Repeat(filler, afterLen/len(filler)+2)[:afterLen]
@@ -381,13 +375,11 @@ func decompressAll(t *testing.T, b []byte) []byte {
 	return got
 }
 
-// TestAppendResumeRoundTrip exercises resume, filestore, and gzipstore
-// together with no RPC involved: it builds an export file, uses resume.Read
-// to find where it stopped, replays the boundary block plus new blocks
-// through filestore.AppendLogsAsync with the cursor's Skip as the filter
-// (via the appropriate append writer for the format), and checks the result
-// byte-for-byte against the original file plus exactly the new logs -- then
-// resumes a second time to confirm the appended file is itself resumable.
+// TestAppendResumeRoundTrip exercises resume, filestore and gzipstore together
+// with no RPC: read the cursor, replay the boundary block plus new blocks
+// through AppendLogsAsync filtered by Skip, check the result byte-for-byte
+// against the original plus exactly the new logs, then resume again to confirm
+// the appended file is itself resumable.
 func TestAppendResumeRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -514,11 +506,9 @@ func TestAppendResumeRoundTrip(t *testing.T) {
 	}
 }
 
-// logsIn returns every log an export file holds, decompressing it first when
-// it is gzip. Anything the file contains that is not a whole, newline
-// terminated NDJSON log line fails the test: a file that merely looks
-// recovered must not pass, so corruption is caught here rather than by a
-// reader downstream.
+// logsIn returns every log an export file holds, decompressing gzip first.
+// Anything that is not a whole, newline-terminated NDJSON line fails the test,
+// so a file that merely looks recovered is caught here rather than downstream.
 func logsIn(t *testing.T, path string) []types.Log {
 	t.Helper()
 
@@ -590,20 +580,15 @@ func feed(logs ...types.Log) <-chan types.Log {
 	return ch
 }
 
-// TestResumeAfterInterruptedWrite covers the three ways a run killed mid-write
-// leaves a file that used to be appended onto blindly, corrupting it: a plain
-// line cut in half, a plain line that parses but never got its newline, and a
-// gzip member that never got its trailer.
+// TestResumeAfterInterruptedWrite covers the three shapes a run killed
+// mid-write leaves behind: a plain line cut in half, a plain line that parses
+// but never got its newline, and a gzip member that never got its trailer.
+// Appending onto any of them blindly corrupts the file.
 //
-// Each case walks the whole recovery: read the cursor, discard everything past
-// the clean boundary it reports, append the logs a resumed query would return,
-// and then require that the file parses end to end and holds exactly the four
-// logs, in order, with none duplicated and none lost. Before the clean
-// boundary existed, the first case fused two logs into one unparseable line,
-// the second did the same and lost the fused log for good because the cursor
-// had told the writer to skip it, and the third left the appended member
-// unreachable behind a corrupt one -- so each assertion below fails loudly on
-// the old behaviour.
+// Each case walks the whole recovery — read the cursor, discard past the clean
+// boundary, append what a resumed query returns — and requires the file to
+// parse end to end holding exactly the four logs, in order, none duplicated
+// and none lost.
 func TestResumeAfterInterruptedWrite(t *testing.T) {
 	t.Parallel()
 
@@ -629,8 +614,8 @@ func TestResumeAfterInterruptedWrite(t *testing.T) {
 		replay []types.Log
 	}{
 		{
-			// The reviewer's first scenario: appending onto the half line
-			// glued the next log onto it, destroying block 102.
+			// Appending onto the half line glues the next log onto it,
+			// destroying block 102.
 			name:          "plain file with a truncated last line",
 			content:       append(append([]byte{}, saved...), []byte(`{"address":"0x45a1502382541cd610cc9068e88727426b6`)...),
 			fileName:      plainFile,
@@ -640,13 +625,10 @@ func TestResumeAfterInterruptedWrite(t *testing.T) {
 			replay:        []types.Log{testLog(101, 0), testLog(102, 0), testLog(103, 0)},
 		},
 		{
-			// The reviewer's second scenario, and the nastiest: the last
-			// line parses, so the old cursor pointed at it and the resumed
-			// query skipped block 101, while the append glued the next log
-			// onto the line that had no newline. Block 101 was fused into an
-			// unparseable line and never re-fetched, so it was unrecoverable.
-			// The cursor must now name block 100 so that 101 is fetched
-			// again.
+			// The nastiest: the line parses, so a cursor naming it would make
+			// the resumed query skip block 101 while the append fuses the next
+			// log onto it — unparseable, and never re-fetched. The cursor must
+			// name block 100 so that 101 is fetched again.
 			name:          "plain file with a valid but unterminated last line",
 			content:       bytes.TrimSuffix(saved, []byte("\n")),
 			fileName:      plainFile,
@@ -656,10 +638,10 @@ func TestResumeAfterInterruptedWrite(t *testing.T) {
 			replay:        []types.Log{testLog(100, 0), testLog(101, 0), testLog(102, 0), testLog(103, 0)},
 		},
 		{
-			// The reviewer's third scenario: the final member lost its
-			// trailer, so a new member appended after it sat behind corrupt
-			// data and could never be read back -- and every later resume
-			// appended more of the same while reporting success.
+			// The final member lost its trailer, so a member appended after
+			// it sits behind corrupt data and can never be read back, while
+			// every later resume appends more of the same and reports
+			// success.
 			name:          "gzip file with a truncated final member",
 			content:       append(gz(t, savedFirst), truncateLast(gz(t, ndjson(t, testLog(101, 0))), 6)...),
 			fileName:      gzipFile,

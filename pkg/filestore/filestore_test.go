@@ -46,10 +46,8 @@ func blocksIn(t *testing.T, path string) []uint64 {
 }
 
 // feed returns a closed channel already holding logs for the given blocks.
-//
-// Topics is set to a non-nil empty slice rather than left nil: go-ethereum's
-// generated Log.UnmarshalJSON rejects a null "topics" field as missing, so a
-// nil Topics would fail the round trip through blocksIn below.
+// Topics must stay a non-nil empty slice: go-ethereum's generated
+// Log.UnmarshalJSON rejects a null "topics" as a missing required field.
 func feed(blocks ...uint64) <-chan types.Log {
 	ch := make(chan types.Log, len(blocks))
 	for _, b := range blocks {

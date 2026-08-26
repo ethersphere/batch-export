@@ -90,7 +90,7 @@ end of the last newline-terminated line that parses as a log entry, or of the
 last whole gzip member — and discards whatever follows it, logging how many
 bytes it dropped and from where:
 
-```
+```log
 "level"="warning" "msg"="resume file ends with a partial write, discarding it" "offset"=89649991 "discardedBytes"=317
 ```
 

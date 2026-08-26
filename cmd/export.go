@@ -101,9 +101,9 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 				return err
 			}
 
-			// The destination is opened before the first log is fetched: were
-			// it opened in the saving goroutine instead, a failure there would
-			// leave the fetcher pushing into a channel nobody drains.
+			// Opened before the first log is fetched: from inside the saving
+			// goroutine, a failure here would leave the fetcher pushing into a
+			// channel nobody drains.
 			w, err := openOutput(outputFile, cursor)
 			if err != nil {
 				return fmt.Errorf("failed to open output file: %w", err)
@@ -194,14 +194,13 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 	return nil
 }
 
-// discardPartialWrite drops the tail an interrupted run left behind in the
-// resume file, so that new logs are appended onto a boundary the reader
-// positively identified rather than onto half a line or half a gzip member.
-// Nothing recoverable is lost: every entry discarded here falls at or after
-// the cursor, so the resumed query fetches it again.
+// discardPartialWrite drops the tail an interrupted run left in the resume
+// file, so logs are appended onto a boundary the reader positively identified
+// rather than onto half a line or half a gzip member. Nothing recoverable is
+// lost: everything discarded falls at or after the cursor and is re-fetched.
 //
-// It is a no-op when there is no resume file or the file ends cleanly, and it
-// never truncates past the offset the reader reported.
+// It is a no-op without a resume file or when the file ends cleanly, and never
+// truncates past the offset the reader reported.
 func (c *command) discardPartialWrite(outputFile string, cursor *resume.Cursor) error {
 	if cursor == nil || !cursor.Truncated {
 		return nil
@@ -241,9 +240,8 @@ func openOutput(outputFile string, cursor *resume.Cursor) (io.WriteCloser, error
 	}
 }
 
-// saveLogs writes logs to w, dropping any entry a resumed export already
-// holds. A nil cursor means the destination starts empty, so every log is
-// kept. w is closed before returning, cancellation included.
+// saveLogs writes logs to w, dropping any entry a resumed export already holds.
+// A nil cursor means the destination starts empty, so every log is kept.
 func saveLogs(ctx context.Context, logChan <-chan types.Log, w io.WriteCloser, cursor *resume.Cursor) error {
 	var skip func(types.Log) bool
 	if cursor != nil {
