@@ -86,7 +86,7 @@ corrupt the file, so only an entry that is complete and properly terminated
 counts as the resume point.
 
 The tool finds the last offset at which the file is known to be complete — the
-end of the last newline-terminated line, or of the last whole gzip member —
+end of the last newline-terminated line that parses as a log entry, or of the last whole gzip member —
 and discards whatever follows it, logging how many bytes it dropped and from
 where:
 
@@ -94,8 +94,8 @@ where:
 "level"="warning" "msg"="resume file ends with a partial write, discarding it" "offset"=89649991 "discardedBytes"=317
 ```
 
-Nothing is lost by that: everything discarded sits at or after the resume
-point, so the resumed query fetches it again. Because a line that parses but
+For export content, nothing is lost by that: everything discarded sits at or after the resume
+point, so the resumed query fetches it again. Anything discarded that was never a log entry is simply removed and not re-fetched. Because a line that parses but
 has no newline does not count, the resume point in that case is the line
 before it, and that entry is re-fetched too.
 
