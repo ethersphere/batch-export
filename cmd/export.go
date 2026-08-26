@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"time"
 
@@ -47,7 +48,7 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 			if resumeFile != "" {
 				cursor, err = resume.Read(resumeFile)
 				if err != nil {
-					return fmt.Errorf("failed to read resume file: %w", err)
+					return fmt.Errorf("failed to read resume file %q: %w", resumeFile, err)
 				}
 
 				if cmd.Flags().Changed("start") {
@@ -96,6 +97,18 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 				startBlock = chainCfg.PostageStampStartBlock
 			}
 
+			if err := c.discardPartialWrite(outputFile, cursor); err != nil {
+				return err
+			}
+
+			// The destination is opened before the first log is fetched: were
+			// it opened in the saving goroutine instead, a failure there would
+			// leave the fetcher pushing into a channel nobody drains.
+			w, err := openOutput(outputFile, cursor)
+			if err != nil {
+				return fmt.Errorf("failed to open output file: %w", err)
+			}
+
 			c.log.Info("Retrieving logs", "startBlock", startBlock, "endBlock", endBlock)
 
 			logChan, errorChan := client.GetLogs(ctx, &eventfetcher.Request{
@@ -113,7 +126,7 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 			go func() {
 				defer wg.Done()
 
-				if err := saveLogs(ctx, logChan, outputFile, cursor); err != nil {
+				if err := saveLogs(ctx, logChan, w, cursor); err != nil {
 					if errors.Is(err, context.Canceled) {
 						c.log.Error(err, "context canceled while saving logs")
 						return
@@ -181,26 +194,61 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 	return nil
 }
 
-// saveLogs writes logs to outputFile. With a nil cursor it replaces the file;
-// otherwise it appends to the file the cursor came from, dropping any log that
-// was already written to it.
-func saveLogs(ctx context.Context, logChan <-chan types.Log, outputFile string, cursor *resume.Cursor) error {
-	if cursor == nil {
-		return filestore.SaveLogsAsync(ctx, logChan, outputFile)
+// discardPartialWrite drops the tail an interrupted run left behind in the
+// resume file, so that new logs are appended onto a boundary the reader
+// positively identified rather than onto half a line or half a gzip member.
+// Nothing recoverable is lost: every entry discarded here falls at or after
+// the cursor, so the resumed query fetches it again.
+//
+// It is a no-op when there is no resume file or the file ends cleanly, and it
+// never truncates past the offset the reader reported.
+func (c *command) discardPartialWrite(outputFile string, cursor *resume.Cursor) error {
+	if cursor == nil || !cursor.Truncated {
+		return nil
 	}
 
-	var (
-		w   io.WriteCloser
-		err error
-	)
-	if cursor.Compressed {
-		w, err = gzipstore.AppendWriter(outputFile)
-	} else {
-		w, err = filestore.AppendWriter(outputFile)
-	}
+	info, err := os.Stat(outputFile)
 	if err != nil {
-		return fmt.Errorf("error opening output file for appending: %w", err)
+		return fmt.Errorf("failed to inspect resume file: %w", err)
+	}
+	if info.Size() <= cursor.CleanSize {
+		return nil
 	}
 
-	return filestore.AppendLogsAsync(ctx, logChan, w, cursor.Skip)
+	c.log.Warning("resume file ends with a partial write, discarding it",
+		"resumeFile", outputFile,
+		"offset", cursor.CleanSize,
+		"discardedBytes", info.Size()-cursor.CleanSize,
+	)
+
+	if err := os.Truncate(outputFile, cursor.CleanSize); err != nil {
+		return fmt.Errorf("failed to truncate resume file: %w", err)
+	}
+
+	return nil
+}
+
+// openOutput opens the destination for a run's logs: a fresh file when cursor
+// is nil, or a writer that appends to the file the cursor came from.
+func openOutput(outputFile string, cursor *resume.Cursor) (io.WriteCloser, error) {
+	switch {
+	case cursor == nil:
+		return filestore.CreateWriter(outputFile)
+	case cursor.Compressed:
+		return gzipstore.AppendWriter(outputFile)
+	default:
+		return filestore.AppendWriter(outputFile)
+	}
+}
+
+// saveLogs writes logs to w, dropping any entry a resumed export already
+// holds. A nil cursor means the destination starts empty, so every log is
+// kept. w is closed before returning, cancellation included.
+func saveLogs(ctx context.Context, logChan <-chan types.Log, w io.WriteCloser, cursor *resume.Cursor) error {
+	var skip func(types.Log) bool
+	if cursor != nil {
+		skip = cursor.Skip
+	}
+
+	return filestore.AppendLogsAsync(ctx, logChan, w, skip)
 }
