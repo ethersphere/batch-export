@@ -2,6 +2,7 @@ package gzipstore
 
 import (
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -34,4 +35,33 @@ func CompressFile(inputFilePath string, outputFilePath string) error {
 	}
 
 	return nil
+}
+
+// AppendWriter opens an existing gzip file for appending and returns a writer
+// that adds a new gzip member to it. Concatenated members form a valid gzip
+// stream, so readers see one continuous file and the existing bytes are never
+// rewritten. The caller must close the writer to flush the member.
+func AppendWriter(filePath string) (io.WriteCloser, error) {
+	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open gzip file '%s' for appending: %w", filePath, err)
+	}
+
+	return &memberWriter{file: file, gzip: gzip.NewWriter(file)}, nil
+}
+
+// memberWriter writes one gzip member and owns the file it was opened from.
+type memberWriter struct {
+	file *os.File
+	gzip *gzip.Writer
+}
+
+func (w *memberWriter) Write(p []byte) (int, error) {
+	return w.gzip.Write(p)
+}
+
+// Close finishes the gzip member and then closes the file. Both are attempted
+// even if the first fails, so the descriptor is never leaked.
+func (w *memberWriter) Close() error {
+	return errors.Join(w.gzip.Close(), w.file.Close())
 }
