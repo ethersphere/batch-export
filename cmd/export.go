@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/core/types"
 	ethclient "github.com/ethersphere/batch-export/pkg/ethclientwrapper"
 	"github.com/ethersphere/batch-export/pkg/eventfetcher"
 	"github.com/ethersphere/batch-export/pkg/filestore"
 	"github.com/ethersphere/batch-export/pkg/gzipstore"
+	"github.com/ethersphere/batch-export/pkg/resume"
 	"github.com/ethersphere/bee/v2/pkg/config"
 	"github.com/ethersphere/bee/v2/pkg/util/abiutil"
 	"github.com/spf13/cobra"
@@ -25,6 +28,7 @@ func (c *command) initExportCmd() (err error) {
 		blockRangeLimit uint32
 		outputFile      string
 		compress        bool
+		resumeFile      string
 	)
 
 	cmd := &cobra.Command{
@@ -38,6 +42,35 @@ The retrieved logs are saved to the specified output file (default: 'export.ndjs
 The process can be interrupted at any time (Ctrl+C), and it will attempt to save already retrieved logs before exiting.`,
 		RunE: func(cmd *cobra.Command, args []string) (err error) {
 			ctx := cmd.Context()
+
+			var cursor *resume.Cursor
+			if resumeFile != "" {
+				cursor, err = resume.Read(resumeFile)
+				if err != nil {
+					return fmt.Errorf("failed to read resume file: %w", err)
+				}
+
+				if cmd.Flags().Changed("start") {
+					c.log.Warning("--start is ignored when --resume is set", "resumeFile", resumeFile)
+				}
+				if cmd.Flags().Changed("output") {
+					c.log.Warning("--output is ignored when --resume is set, logs are appended to the resume file", "resumeFile", resumeFile)
+				}
+				if cursor.Compressed && compress {
+					c.log.Warning("--compress is ignored when resuming an already compressed file", "resumeFile", resumeFile)
+					compress = false
+				}
+
+				outputFile = resumeFile
+				startBlock = cursor.BlockNumber
+
+				c.log.Info("Resuming export",
+					"resumeFile", resumeFile,
+					"startBlock", startBlock,
+					"lastLogIndex", cursor.LogIndex,
+					"compressed", cursor.Compressed,
+				)
+			}
 
 			ec, err := ethclient.NewClient(ctx, rpcEndpoint, ethclient.WithRateLimit(maxRequest), ethclient.WithLogger(c.log))
 			if err != nil {
@@ -79,7 +112,8 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 
 			go func() {
 				defer wg.Done()
-				if err := filestore.SaveLogsAsync(ctx, logChan, outputFile); err != nil {
+
+				if err := saveLogs(ctx, logChan, outputFile, cursor); err != nil {
 					if errors.Is(err, context.Canceled) {
 						c.log.Error(err, "context canceled while saving logs")
 						return
@@ -112,6 +146,7 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 					c.log.Info("still retrieving logs...")
 				case <-ctx.Done():
 					c.log.Info("context canceled, waiting for logs to be saved...")
+					wg.Wait()
 					if err := compressFunc(); err != nil {
 						return errors.Join(fmt.Errorf("error compressing file: %w", err), ctx.Err())
 					}
@@ -139,8 +174,33 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 	cmd.Flags().Uint32VarP(&blockRangeLimit, "block-range-limit", "b", 5, "Max blocks per log query")
 	cmd.Flags().StringVarP(&outputFile, "output", "o", "export.ndjson", "Output file path (NDJSON)")
 	cmd.Flags().BoolVarP(&compress, "compress", "c", false, "Compress to GZIP")
+	cmd.Flags().StringVarP(&resumeFile, "resume", "r", "", "Resume a previous export file (.ndjson, .gz or .gzip); overrides --start and --output")
 
 	c.root.AddCommand(cmd)
 
 	return nil
+}
+
+// saveLogs writes logs to outputFile. With a nil cursor it replaces the file;
+// otherwise it appends to the file the cursor came from, dropping any log that
+// was already written to it.
+func saveLogs(ctx context.Context, logChan <-chan types.Log, outputFile string, cursor *resume.Cursor) error {
+	if cursor == nil {
+		return filestore.SaveLogsAsync(ctx, logChan, outputFile)
+	}
+
+	var (
+		w   io.WriteCloser
+		err error
+	)
+	if cursor.Compressed {
+		w, err = gzipstore.AppendWriter(outputFile)
+	} else {
+		w, err = filestore.AppendWriter(outputFile)
+	}
+	if err != nil {
+		return fmt.Errorf("error opening output file for appending: %w", err)
+	}
+
+	return filestore.AppendLogsAsync(ctx, logChan, w, cursor.Skip)
 }
