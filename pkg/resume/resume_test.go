@@ -5,9 +5,11 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -22,6 +24,13 @@ import (
 // walking backwards from EOF. Tests use it to construct cases that straddle
 // a window boundary.
 const windowSize = 64 * 1024
+
+// Export file names. The format is detected from the file's leading bytes, so
+// the name a case uses never decides how it is read.
+const (
+	plainFile = "export.ndjson"
+	gzipFile  = "export.ndjson.gzip"
+)
 
 // testLog builds a log shaped like the ones the exporter writes. types.Log
 // always marshals blockNumber and logIndex, even at zero.
@@ -66,6 +75,12 @@ func gz(t *testing.T, b []byte) []byte {
 		t.Fatalf("gzip close: %v", err)
 	}
 	return buf.Bytes()
+}
+
+// truncateLast drops the final n bytes of b, standing in for a write that a
+// hard kill cut short.
+func truncateLast(b []byte, n int) []byte {
+	return b[:len(b)-n]
 }
 
 // write puts content in a temp file and returns its path.
@@ -122,12 +137,22 @@ func TestReadCursor(t *testing.T) {
 		t.Fatalf("test setup: boundary %d does not straddle target line [%d, %d)", straddleBoundary, straddleLineStart, straddleLineEnd)
 	}
 
+	// twoLogsEnd is the offset just past the newline closing the second of
+	// threeLogs: the last clean boundary once the third line loses its own.
+	twoLogsEnd := int64(len(ndjson(t, testLog(100, 0), testLog(101, 1))))
+	threeLogsEnd := int64(len(threeLogs))
+
 	tests := []struct {
 		name           string
 		content        []byte
 		wantBlock      uint64
 		wantIndex      uint
 		wantCompressed bool
+		// wantTruncated says whether bytes follow the last clean boundary.
+		// When it is false the boundary must be the end of the file, so
+		// wantCleanSize is only consulted for the truncated cases.
+		wantTruncated bool
+		wantCleanSize int64
 	}{
 		{
 			name:      "plain ndjson",
@@ -142,22 +167,35 @@ func TestReadCursor(t *testing.T) {
 			wantIndex: 3,
 		},
 		{
-			name:      "truncated trailing line is discarded",
-			content:   append(append([]byte{}, threeLogs...), []byte(`{"address":"0x45a15","topics":["0xae`)...),
-			wantBlock: 102,
-			wantIndex: 7,
+			// A line cut short by an interrupted write. The cursor is the
+			// line before it and the partial bytes are reported, so a caller
+			// discards them instead of appending onto them.
+			name:          "truncated trailing line is excluded from the clean boundary",
+			content:       append(append([]byte{}, threeLogs...), []byte(`{"address":"0x45a15","topics":["0xae`)...),
+			wantBlock:     102,
+			wantIndex:     7,
+			wantTruncated: true,
+			wantCleanSize: threeLogsEnd,
 		},
 		{
-			name:      "trailing line without newline is still read",
-			content:   bytes.TrimSuffix(threeLogs, []byte("\n")),
-			wantBlock: 102,
-			wantIndex: 7,
+			// json.Encoder writes a value and its newline in one call, so a
+			// last line that parses but has no newline is still a partial
+			// write: the cursor must fall back to the line before it, or the
+			// unterminated log would be skipped on resume and lost.
+			name:          "trailing line without a newline is not a clean end",
+			content:       bytes.TrimSuffix(threeLogs, []byte("\n")),
+			wantBlock:     101,
+			wantIndex:     1,
+			wantTruncated: true,
+			wantCleanSize: twoLogsEnd,
 		},
 		{
-			name:      "line missing blockNumber is skipped",
-			content:   append(append([]byte{}, threeLogs...), []byte("{\"address\":\"0x1\",\"topics\":[],\"data\":\"0x\"}\n")...),
-			wantBlock: 102,
-			wantIndex: 7,
+			name:          "line missing blockNumber is skipped",
+			content:       append(append([]byte{}, threeLogs...), []byte("{\"address\":\"0x1\",\"topics\":[],\"data\":\"0x\"}\n")...),
+			wantBlock:     102,
+			wantIndex:     7,
+			wantTruncated: true,
+			wantCleanSize: threeLogsEnd,
 		},
 		{
 			name:      "spans multiple backward read windows",
@@ -166,16 +204,20 @@ func TestReadCursor(t *testing.T) {
 			wantIndex: 15,
 		},
 		{
-			name:      "walks back across windows of garbage lines",
-			content:   append(append([]byte{}, threeLogs...), garbageLines...),
-			wantBlock: 102,
-			wantIndex: 7,
+			name:          "walks back across windows of garbage lines",
+			content:       append(append([]byte{}, threeLogs...), garbageLines...),
+			wantBlock:     102,
+			wantIndex:     7,
+			wantTruncated: true,
+			wantCleanSize: threeLogsEnd,
 		},
 		{
-			name:      "valid line straddles a window boundary",
-			content:   straddle,
-			wantBlock: 4096,
-			wantIndex: 3,
+			name:          "valid line straddles a window boundary",
+			content:       straddle,
+			wantBlock:     4096,
+			wantIndex:     3,
+			wantTruncated: true,
+			wantCleanSize: int64(straddleLineEnd),
 		},
 		{
 			name:           "gzip",
@@ -200,12 +242,27 @@ func TestReadCursor(t *testing.T) {
 		},
 		{
 			// A resume interrupted before the second member was flushed: the
-			// header is present but carries no decodable data.
+			// header is present but carries no decodable data. The clean
+			// boundary is the end of the first member, so the half-written
+			// header is reported rather than appended onto.
 			name:           "multi member gzip with unflushed final member",
 			content:        append(gz(t, threeLogs), []byte{0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff}...),
 			wantBlock:      102,
 			wantIndex:      7,
 			wantCompressed: true,
+			wantTruncated:  true,
+			wantCleanSize:  int64(len(gz(t, threeLogs))),
+		},
+		{
+			// Only the last member's trailer is lost. Everything before it is
+			// still a member boundary, so the file stays recoverable.
+			name:           "multi member gzip with a truncated final member",
+			content:        truncateLast(append(gz(t, threeLogs), gz(t, ndjson(t, testLog(200, 2)))...), 6),
+			wantBlock:      102,
+			wantIndex:      7,
+			wantCompressed: true,
+			wantTruncated:  true,
+			wantCleanSize:  int64(len(gz(t, threeLogs))),
 		},
 	}
 
@@ -213,7 +270,7 @@ func TestReadCursor(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := resume.Read(write(t, "export.ndjson", tt.content))
+			got, err := resume.Read(write(t, plainFile, tt.content))
 			if err != nil {
 				t.Fatalf("Read() error = %v, want nil", err)
 			}
@@ -225,6 +282,19 @@ func TestReadCursor(t *testing.T) {
 			}
 			if got.Compressed != tt.wantCompressed {
 				t.Errorf("Compressed = %t, want %t", got.Compressed, tt.wantCompressed)
+			}
+			if got.Truncated != tt.wantTruncated {
+				t.Errorf("Truncated = %t, want %t", got.Truncated, tt.wantTruncated)
+			}
+
+			// A file reported as untruncated must be clean all the way to its
+			// end, which is the invariant an appending caller relies on.
+			wantCleanSize := int64(len(tt.content))
+			if tt.wantTruncated {
+				wantCleanSize = tt.wantCleanSize
+			}
+			if got.CleanSize != wantCleanSize {
+				t.Errorf("CleanSize = %d, want %d", got.CleanSize, wantCleanSize)
 			}
 		})
 	}
@@ -247,7 +317,7 @@ func TestReadCursorErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := resume.Read(write(t, "export.ndjson", tt.content))
+			_, err := resume.Read(write(t, plainFile, tt.content))
 			if !errors.Is(err, resume.ErrNoLogs) {
 				t.Fatalf("Read() error = %v, want ErrNoLogs", err)
 			}
@@ -360,7 +430,7 @@ func TestAppendResumeRoundTrip(t *testing.T) {
 				name = "export.ndjson.gz"
 			} else {
 				originalBytes = plain
-				name = "export.ndjson"
+				name = plainFile
 			}
 			path := write(t, name, originalBytes)
 
@@ -441,5 +511,327 @@ func TestAppendResumeRoundTrip(t *testing.T) {
 				t.Errorf("resumed Compressed = %t, want %t", cursor2.Compressed, tt.compressed)
 			}
 		})
+	}
+}
+
+// logsIn returns every log an export file holds, decompressing it first when
+// it is gzip. Anything the file contains that is not a whole, newline
+// terminated NDJSON log line fails the test: a file that merely looks
+// recovered must not pass, so corruption is caught here rather than by a
+// reader downstream.
+func logsIn(t *testing.T, path string) []types.Log {
+	t.Helper()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if bytes.HasPrefix(raw, []byte{0x1f, 0x8b}) {
+		raw = decompressAll(t, raw)
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	if raw[len(raw)-1] != '\n' {
+		t.Fatalf("file does not end on a line boundary, last 80 bytes: %q", raw[max(0, len(raw)-80):])
+	}
+
+	var logs []types.Log
+	for i, line := range bytes.Split(bytes.TrimSuffix(raw, []byte("\n")), []byte("\n")) {
+		var l types.Log
+		if err := json.Unmarshal(line, &l); err != nil {
+			t.Fatalf("line %d does not parse: %v: %q", i+1, err, line)
+		}
+		logs = append(logs, l)
+	}
+
+	return logs
+}
+
+// ids renders logs as block/index pairs, the identity in which "no log
+// duplicated and none lost" is measured.
+func ids(logs []types.Log) []string {
+	out := make([]string, 0, len(logs))
+	for _, l := range logs {
+		out = append(out, fmt.Sprintf("%d/%d", l.BlockNumber, l.Index))
+	}
+
+	return out
+}
+
+// appendWriter opens the append writer that matches the cursor's format.
+func appendWriter(t *testing.T, path string, cursor *resume.Cursor) io.WriteCloser {
+	t.Helper()
+
+	var (
+		w   io.WriteCloser
+		err error
+	)
+	if cursor.Compressed {
+		w, err = gzipstore.AppendWriter(path)
+	} else {
+		w, err = filestore.AppendWriter(path)
+	}
+	if err != nil {
+		t.Fatalf("AppendWriter() error = %v", err)
+	}
+
+	return w
+}
+
+// feed returns a closed channel already holding logs.
+func feed(logs ...types.Log) <-chan types.Log {
+	ch := make(chan types.Log, len(logs))
+	for _, l := range logs {
+		ch <- l
+	}
+	close(ch)
+
+	return ch
+}
+
+// TestResumeAfterInterruptedWrite covers the three ways a run killed mid-write
+// leaves a file that used to be appended onto blindly, corrupting it: a plain
+// line cut in half, a plain line that parses but never got its newline, and a
+// gzip member that never got its trailer.
+//
+// Each case walks the whole recovery: read the cursor, discard everything past
+// the clean boundary it reports, append the logs a resumed query would return,
+// and then require that the file parses end to end and holds exactly the four
+// logs, in order, with none duplicated and none lost. Before the clean
+// boundary existed, the first case fused two logs into one unparseable line,
+// the second did the same and lost the fused log for good because the cursor
+// had told the writer to skip it, and the third left the appended member
+// unreachable behind a corrupt one -- so each assertion below fails loudly on
+// the old behaviour.
+func TestResumeAfterInterruptedWrite(t *testing.T) {
+	t.Parallel()
+
+	// saved is what the interrupted run had managed to write whole.
+	saved := ndjson(t, testLog(100, 0), testLog(101, 0))
+	savedFirst := ndjson(t, testLog(100, 0))
+
+	// want is the full export: what the file must hold once resumed.
+	want := []types.Log{testLog(100, 0), testLog(101, 0), testLog(102, 0), testLog(103, 0)}
+
+	tests := []struct {
+		name string
+		// content is the file the interrupted run left behind.
+		content    []byte
+		fileName   string
+		compressed bool
+		// wantBlock and wantIndex are the last entry that is complete and
+		// properly terminated.
+		wantBlock     uint64
+		wantIndex     uint
+		wantCleanSize int64
+		// replay is what the resumed query returns from wantBlock onwards.
+		replay []types.Log
+	}{
+		{
+			// The reviewer's first scenario: appending onto the half line
+			// glued the next log onto it, destroying block 102.
+			name:          "plain file with a truncated last line",
+			content:       append(append([]byte{}, saved...), []byte(`{"address":"0x45a1502382541cd610cc9068e88727426b6`)...),
+			fileName:      plainFile,
+			wantBlock:     101,
+			wantIndex:     0,
+			wantCleanSize: int64(len(saved)),
+			replay:        []types.Log{testLog(101, 0), testLog(102, 0), testLog(103, 0)},
+		},
+		{
+			// The reviewer's second scenario, and the nastiest: the last
+			// line parses, so the old cursor pointed at it and the resumed
+			// query skipped block 101, while the append glued the next log
+			// onto the line that had no newline. Block 101 was fused into an
+			// unparseable line and never re-fetched, so it was unrecoverable.
+			// The cursor must now name block 100 so that 101 is fetched
+			// again.
+			name:          "plain file with a valid but unterminated last line",
+			content:       bytes.TrimSuffix(saved, []byte("\n")),
+			fileName:      plainFile,
+			wantBlock:     100,
+			wantIndex:     0,
+			wantCleanSize: int64(len(savedFirst)),
+			replay:        []types.Log{testLog(100, 0), testLog(101, 0), testLog(102, 0), testLog(103, 0)},
+		},
+		{
+			// The reviewer's third scenario: the final member lost its
+			// trailer, so a new member appended after it sat behind corrupt
+			// data and could never be read back -- and every later resume
+			// appended more of the same while reporting success.
+			name:          "gzip file with a truncated final member",
+			content:       append(gz(t, savedFirst), truncateLast(gz(t, ndjson(t, testLog(101, 0))), 6)...),
+			fileName:      gzipFile,
+			compressed:    true,
+			wantBlock:     100,
+			wantIndex:     0,
+			wantCleanSize: int64(len(gz(t, savedFirst))),
+			replay:        []types.Log{testLog(100, 0), testLog(101, 0), testLog(102, 0), testLog(103, 0)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := write(t, tt.fileName, tt.content)
+
+			cursor, err := resume.Read(path)
+			if err != nil {
+				t.Fatalf("Read() error = %v", err)
+			}
+			if cursor.BlockNumber != tt.wantBlock || cursor.LogIndex != tt.wantIndex {
+				t.Fatalf("cursor = {%d,%d}, want {%d,%d}", cursor.BlockNumber, cursor.LogIndex, tt.wantBlock, tt.wantIndex)
+			}
+			if cursor.Compressed != tt.compressed {
+				t.Fatalf("Compressed = %t, want %t", cursor.Compressed, tt.compressed)
+			}
+			if !cursor.Truncated {
+				t.Fatalf("Truncated = false, want true: the partial write went unreported")
+			}
+			if cursor.CleanSize != tt.wantCleanSize {
+				t.Fatalf("CleanSize = %d, want %d", cursor.CleanSize, tt.wantCleanSize)
+			}
+
+			// Recovery: drop the partial tail, exactly as the export command
+			// does, and never further than the reported boundary.
+			if err := os.Truncate(path, cursor.CleanSize); err != nil {
+				t.Fatalf("truncate %s: %v", path, err)
+			}
+
+			if err := filestore.AppendLogsAsync(t.Context(), feed(tt.replay...), appendWriter(t, path, cursor), cursor.Skip); err != nil {
+				t.Fatalf("AppendLogsAsync() error = %v", err)
+			}
+
+			if got := ids(logsIn(t, path)); !slices.Equal(got, ids(want)) {
+				t.Fatalf("logs = %v, want %v", got, ids(want))
+			}
+
+			// The recovered file must itself resume cleanly, or a second
+			// interruption would start the corruption over again.
+			cursor2, err := resume.Read(path)
+			if err != nil {
+				t.Fatalf("second Read() error = %v", err)
+			}
+			if cursor2.BlockNumber != 103 || cursor2.LogIndex != 0 {
+				t.Errorf("resumed cursor = {%d,%d}, want {103,0}", cursor2.BlockNumber, cursor2.LogIndex)
+			}
+			if cursor2.Truncated {
+				t.Errorf("Truncated = true, want false: the recovered file is not clean")
+			}
+		})
+	}
+}
+
+// TestReadRefusesWithoutACleanBoundary covers files whose content cannot be
+// appended to at any offset the reader can positively identify. Refusing is
+// the safety property that has to hold even where recovery cannot: guessing a
+// boundary would corrupt what is already there.
+func TestReadRefusesWithoutACleanBoundary(t *testing.T) {
+	t.Parallel()
+
+	logs := ndjson(t, testLog(100, 0), testLog(101, 0))
+
+	tests := []struct {
+		name    string
+		content []byte
+		wantErr error
+	}{
+		{
+			// A single member whose trailer never made it to disk. Its logs
+			// decode, but there is no member boundary to concatenate at and
+			// the file cannot be rewritten in place, so the run must stop.
+			name:    "gzip with a single truncated member",
+			content: truncateLast(gz(t, logs), 6),
+			wantErr: resume.ErrNoCleanBoundary,
+		},
+		{
+			// The member is intact but its data stops mid-line, so a second
+			// member would glue its first log onto the unterminated one.
+			name:    "gzip member ending mid line",
+			content: gz(t, bytes.TrimSuffix(logs, []byte("\n"))),
+			wantErr: resume.ErrNoCleanBoundary,
+		},
+		{
+			// The only line has no newline, so no entry is complete.
+			name:    "plain file holding one unterminated line",
+			content: bytes.TrimSuffix(ndjson(t, testLog(100, 0)), []byte("\n")),
+			wantErr: resume.ErrNoLogs,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := resume.Read(write(t, plainFile, tt.content)); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Read() error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestReadReportsGzipReadErrors pins Fix 2: a gzip stream that stops early
+// must not be reported as a clean read just because some lines decoded. The
+// old code returned the last cursor it had seen with a nil error, which let
+// every later resume append more data behind the corruption, for ever.
+func TestReadReportsGzipReadErrors(t *testing.T) {
+	t.Parallel()
+
+	clean := gz(t, ndjson(t, testLog(100, 0)))
+	content := append(append([]byte{}, clean...), truncateLast(gz(t, ndjson(t, testLog(101, 0), testLog(102, 0))), 6)...)
+
+	cursor, err := resume.Read(write(t, gzipFile, content))
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if !cursor.Truncated {
+		t.Error("Truncated = false, want true: the unclean stream was reported as clean")
+	}
+	if cursor.CleanSize != int64(len(clean)) {
+		t.Errorf("CleanSize = %d, want %d", cursor.CleanSize, len(clean))
+	}
+	// The cursor must not name a log that only the broken member holds: it is
+	// about to be discarded, and a cursor past it would skip the refetch.
+	if cursor.BlockNumber != 100 || cursor.LogIndex != 0 {
+		t.Errorf("cursor = {%d,%d}, want {100,0}", cursor.BlockNumber, cursor.LogIndex)
+	}
+}
+
+// TestGzipCleanSizeIsAMemberBoundary checks the offset the gzip walk reports
+// is exactly a member boundary and not a byte off, which is what makes
+// truncating to it safe. Reading the file back after cutting it there must
+// yield the members that came before, whole.
+func TestGzipCleanSizeIsAMemberBoundary(t *testing.T) {
+	t.Parallel()
+
+	first := ndjson(t, testLog(100, 0), testLog(101, 0))
+	second := ndjson(t, testLog(102, 0))
+
+	members := append(gz(t, first), gz(t, second)...)
+	boundary := int64(len(members))
+	content := append(append([]byte{}, members...), truncateLast(gz(t, ndjson(t, testLog(103, 0))), 4)...)
+
+	path := write(t, gzipFile, content)
+
+	cursor, err := resume.Read(path)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if cursor.CleanSize != boundary {
+		t.Fatalf("CleanSize = %d, want %d", cursor.CleanSize, boundary)
+	}
+
+	if err := os.Truncate(path, cursor.CleanSize); err != nil {
+		t.Fatalf("truncate %s: %v", path, err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if got, want := decompressAll(t, raw), append(append([]byte{}, first...), second...); !bytes.Equal(got, want) {
+		t.Fatalf("content = %s, want %s", got, want)
 	}
 }
