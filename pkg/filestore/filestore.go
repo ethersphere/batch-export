@@ -3,6 +3,7 @@ package filestore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,16 +11,27 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// SaveLogsAsync writes logs to a file asynchronously, replacing any file
-// already at filePath.
-func SaveLogsAsync(ctx context.Context, logChan <-chan types.Log, filePath string) error {
+// CreateWriter creates the file at filePath, replacing anything already there,
+// and returns a writer for it. Opening the destination separately lets a
+// caller fail before it starts producing logs it would have nowhere to put.
+func CreateWriter(filePath string) (io.WriteCloser, error) {
 	file, err := os.Create(filePath)
 	if err != nil {
-		return fmt.Errorf("error creating file: %w", err)
+		return nil, fmt.Errorf("error creating file: %w", err)
 	}
-	defer file.Close()
 
-	return writeLogs(ctx, logChan, file, nil)
+	return file, nil
+}
+
+// SaveLogsAsync writes logs to a file asynchronously, replacing any file
+// already at filePath. The file is closed before returning.
+func SaveLogsAsync(ctx context.Context, logChan <-chan types.Log, filePath string) error {
+	w, err := CreateWriter(filePath)
+	if err != nil {
+		return err
+	}
+
+	return AppendLogsAsync(ctx, logChan, w, nil)
 }
 
 // AppendWriter opens an existing NDJSON file for appending.
@@ -36,8 +48,14 @@ func AppendWriter(filePath string) (io.WriteCloser, error) {
 // destination already holds. Logs for which skip reports true are dropped; a
 // nil skip writes every log. The writer is closed before returning, including
 // when the context is cancelled, so a buffered destination is always flushed.
-func AppendLogsAsync(ctx context.Context, logChan <-chan types.Log, w io.WriteCloser, skip func(types.Log) bool) error {
-	defer w.Close()
+//
+// The close error is joined into the result rather than discarded: on a
+// compressed destination Close writes the terminator and footer that make the
+// data readable, so a failure there leaves a truncated member behind and must
+// not be reported as a completed save. Joining preserves errors.Is, so a
+// cancelled context still reads as context.Canceled.
+func AppendLogsAsync(ctx context.Context, logChan <-chan types.Log, w io.WriteCloser, skip func(types.Log) bool) (err error) {
+	defer func() { err = errors.Join(err, w.Close()) }()
 
 	return writeLogs(ctx, logChan, w, skip)
 }

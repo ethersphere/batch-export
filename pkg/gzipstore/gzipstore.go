@@ -61,7 +61,13 @@ func (w *memberWriter) Write(p []byte) (int, error) {
 }
 
 // Close finishes the gzip member and then closes the file. Both are attempted
-// even if the first fails, so the descriptor is never leaked.
+// even if the first fails, so the descriptor is never leaked. Closing the
+// member writes the data the file needs to be readable at all, so the error
+// names the file it belongs to.
 func (w *memberWriter) Close() error {
-	return errors.Join(w.gzip.Close(), w.file.Close())
+	if err := errors.Join(w.gzip.Close(), w.file.Close()); err != nil {
+		return fmt.Errorf("failed to close gzip file '%s': %w", w.file.Name(), err)
+	}
+
+	return nil
 }
