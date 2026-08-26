@@ -72,10 +72,37 @@ extension, so `.gz` and `.gzip` both work:
 ```
 
 The resumed block is re-queried, because an interrupted run may have saved only
-part of it; entries already in the file are skipped, so resuming never
-duplicates or drops a log. Appending to a compressed export adds a second gzip
-member — standard tools such as `gzcat`, `gunzip`, and Go's `compress/gzip`
-read the result as one continuous stream.
+part of it, and the entries already in the file are skipped. So long as the
+file ends cleanly, resuming neither duplicates nor drops a log. Appending to a
+compressed export adds a second gzip member — standard tools such as `gzcat`,
+`gunzip`, and Go's `compress/gzip` read the result as one continuous stream.
+
+#### When the previous run was killed mid-write
+
+A run stopped by `SIGKILL`, a crash, or a full disk can leave a partial entry
+at the end of the file: half a line, a line that never got its newline, or a
+gzip member that never got its trailer. Appending onto any of those would
+corrupt the file, so only an entry that is complete and properly terminated
+counts as the resume point.
+
+The tool finds the last offset at which the file is known to be complete — the
+end of the last newline-terminated line, or of the last whole gzip member —
+and discards whatever follows it, logging how many bytes it dropped and from
+where:
+
+```
+"level"="warning" "msg"="resume file ends with a partial write, discarding it" "offset"=89649991 "discardedBytes"=317
+```
+
+Nothing is lost by that: everything discarded sits at or after the resume
+point, so the resumed query fetches it again. Because a line that parses but
+has no newline does not count, the resume point in that case is the line
+before it, and that entry is re-fetched too.
+
+If no such offset can be identified — a gzip file whose only member is
+truncated, for instance, since there is no member boundary to append at — the
+tool refuses to touch the file and exits with an error rather than guess. Fall
+back to a fresh export in that case.
 
 When `--resume` is set it overrides `--start` and `--output`.
 
