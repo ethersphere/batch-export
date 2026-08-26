@@ -5,12 +5,15 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethersphere/batch-export/pkg/filestore"
+	"github.com/ethersphere/batch-export/pkg/gzipstore"
 	"github.com/ethersphere/batch-export/pkg/resume"
 )
 
@@ -284,6 +287,158 @@ func TestCursorSkip(t *testing.T) {
 
 			if got := cursor.Skip(tt.log); got != tt.want {
 				t.Errorf("Skip() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+// decompressAll reads every byte of a (possibly multi-member) gzip stream.
+// Multistream is on by default, so concatenated members read as one stream.
+func decompressAll(t *testing.T, b []byte) []byte {
+	t.Helper()
+
+	reader, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	defer reader.Close()
+
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("decompress: %v", err)
+	}
+
+	return got
+}
+
+// TestAppendResumeRoundTrip exercises resume, filestore, and gzipstore
+// together with no RPC involved: it builds an export file, uses resume.Read
+// to find where it stopped, replays the boundary block plus new blocks
+// through filestore.AppendLogsAsync with the cursor's Skip as the filter
+// (via the appropriate append writer for the format), and checks the result
+// byte-for-byte against the original file plus exactly the new logs -- then
+// resumes a second time to confirm the appended file is itself resumable.
+func TestAppendResumeRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		compressed bool
+	}{
+		{name: "plain ndjson"},
+		{name: "gzip", compressed: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// original spans three blocks, the last of which carries two
+			// logs, so resuming must handle a genuinely partial block.
+			original := []types.Log{
+				testLog(100, 0),
+				testLog(101, 0),
+				testLog(102, 0),
+				testLog(102, 1),
+			}
+			// boundaryHigher shares the cursor's block but was never saved,
+			// so it must be written rather than skipped.
+			boundaryHigher := testLog(102, 2)
+			newer := []types.Log{
+				testLog(103, 0),
+				testLog(104, 0),
+			}
+
+			plain := ndjson(t, original...)
+
+			var (
+				originalBytes []byte
+				name          string
+			)
+			if tt.compressed {
+				originalBytes = gz(t, plain)
+				name = "export.ndjson.gz"
+			} else {
+				originalBytes = plain
+				name = "export.ndjson"
+			}
+			path := write(t, name, originalBytes)
+
+			cursor, err := resume.Read(path)
+			if err != nil {
+				t.Fatalf("Read() error = %v", err)
+			}
+			if cursor.BlockNumber != 102 || cursor.LogIndex != 1 {
+				t.Fatalf("cursor = {%d,%d}, want {102,1}", cursor.BlockNumber, cursor.LogIndex)
+			}
+			if cursor.Compressed != tt.compressed {
+				t.Fatalf("Compressed = %t, want %t", cursor.Compressed, tt.compressed)
+			}
+
+			var w io.WriteCloser
+			if cursor.Compressed {
+				w, err = gzipstore.AppendWriter(path)
+			} else {
+				w, err = filestore.AppendWriter(path)
+			}
+			if err != nil {
+				t.Fatalf("AppendWriter() error = %v", err)
+			}
+
+			// replay mimics a resumed export re-querying the boundary block:
+			// its already-written logs must be skipped, its never-saved
+			// higher-index log must not be, and the later blocks are new.
+			replay := make([]types.Log, 0, 3+len(newer))
+			replay = append(replay, testLog(102, 0), testLog(102, 1), boundaryHigher)
+			replay = append(replay, newer...)
+
+			ch := make(chan types.Log, len(replay))
+			for _, l := range replay {
+				ch <- l
+			}
+			close(ch)
+
+			if err := filestore.AppendLogsAsync(t.Context(), ch, w, cursor.Skip); err != nil {
+				t.Fatalf("AppendLogsAsync() error = %v", err)
+			}
+
+			gotRaw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read %s: %v", path, err)
+			}
+
+			// The original bytes must survive as an unchanged prefix:
+			// appending must never rewrite existing content. For gzip this
+			// also proves a genuine second member was added rather than the
+			// archive being decompressed and rewritten.
+			if len(gotRaw) < len(originalBytes) || !bytes.Equal(gotRaw[:len(originalBytes)], originalBytes) {
+				t.Fatalf("original bytes are not an unchanged prefix of the appended file")
+			}
+
+			gotPlain := gotRaw
+			if tt.compressed {
+				gotPlain = decompressAll(t, gotRaw)
+			}
+
+			all := make([]types.Log, 0, len(original)+1+len(newer))
+			all = append(all, original...)
+			all = append(all, boundaryHigher)
+			all = append(all, newer...)
+			want := ndjson(t, all...)
+
+			if !bytes.Equal(gotPlain, want) {
+				t.Fatalf("content = %s, want %s", gotPlain, want)
+			}
+
+			cursor2, err := resume.Read(path)
+			if err != nil {
+				t.Fatalf("second Read() error = %v", err)
+			}
+			if cursor2.BlockNumber != 104 || cursor2.LogIndex != 0 {
+				t.Errorf("resumed cursor = {%d,%d}, want {104,0}", cursor2.BlockNumber, cursor2.LogIndex)
+			}
+			if cursor2.Compressed != tt.compressed {
+				t.Errorf("resumed Compressed = %t, want %t", cursor2.Compressed, tt.compressed)
 			}
 		})
 	}
