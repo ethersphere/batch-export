@@ -42,7 +42,8 @@ and respects RPC rate limits (--max-request).
 The retrieved logs are saved to the specified output file (default: 'export.ndjson') in NDJSON format.
 The process can be interrupted at any time (Ctrl+C), and it will attempt to save already retrieved logs before exiting.`,
 		RunE: func(cmd *cobra.Command, args []string) (err error) {
-			ctx := cmd.Context()
+			ctx, cancel := context.WithCancel(cmd.Context())
+			defer cancel()
 
 			var cursor *resume.Cursor
 			if resumeFile != "" {
@@ -134,6 +135,7 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 			ticker := time.NewTicker(15 * time.Second)
 			defer ticker.Stop()
 
+			var saveErr error
 			go func() {
 				defer wg.Done()
 
@@ -143,6 +145,10 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 						return
 					}
 					c.log.Error(err, "error saving logs")
+					// Stop the fetcher too: with the saver gone, logChan
+					// would fill and block it forever.
+					saveErr = err
+					cancel()
 					return
 				}
 				c.log.Info("all logs have been saved", "outputFile", outputFile)
@@ -164,13 +170,17 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 					if !ok {
 						errorChan = nil
 					} else {
-						return fmt.Errorf("error retrieving logs: %w", err)
+						wg.Wait()
+						return errors.Join(fmt.Errorf("error retrieving logs: %w", err), saveErr)
 					}
 				case <-ticker.C:
 					c.log.Info("still retrieving logs...")
 				case <-ctx.Done():
 					c.log.Info("context canceled, waiting for logs to be saved...")
 					wg.Wait()
+					if saveErr != nil {
+						return saveErr
+					}
 					if err := compressFunc(); err != nil {
 						return errors.Join(fmt.Errorf("error compressing file: %w", err), ctx.Err())
 					}
@@ -183,6 +193,9 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 			}
 
 			wg.Wait()
+			if saveErr != nil {
+				return saveErr
+			}
 			if err := compressFunc(); err != nil {
 				return fmt.Errorf("error compressing file: %w", err)
 			}
