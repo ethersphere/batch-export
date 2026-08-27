@@ -171,6 +171,9 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 						errorChan = nil
 					} else {
 						wg.Wait()
+						if saveErr != nil && errors.Is(err, context.Canceled) {
+							return saveErr
+						}
 						return errors.Join(fmt.Errorf("error retrieving logs: %w", err), saveErr)
 					}
 				case <-ticker.C:
