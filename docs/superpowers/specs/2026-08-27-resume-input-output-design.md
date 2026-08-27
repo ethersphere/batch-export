@@ -26,6 +26,10 @@ the interface or the documentation.
   different chain parses identically; detecting the mismatch would need a file
   header, which changes the format `batch-archive` consumes. Documented
   limitation.
+- **Revalidating the input between the cursor read and the append**, and
+  running two resumes of one file concurrently. The model is a single
+  operator; a follow-up may carry the input's size and mtime in the cursor
+  and refuse in `PrepareOutput` if the file moved.
 - **Validating the interior of plain files.** Plain-file validation covers the
   region the cursor reading must touch (the tail); silent corruption elsewhere
   in a 90 MB file is out of scope. (Gzip necessarily decodes the whole stream,
@@ -103,8 +107,8 @@ Exactly that irregularity is tolerated: the cursor is the last complete entry
 before it, `CleanSize` excludes it, `Truncated` is true, and each mode handles
 it per §4 (copy mode does not copy it; in-place truncates it). Nothing else is
 tolerated. Any of the following mean the file is not untouched tool output,
-and `Read` refuses with `ErrNotAnExport`, naming what was found and at which
-offset:
+and `Read` refuses with `ErrNotAnExport`, naming what was found and where — a
+byte offset for plain files, a member index and line number for gzip:
 
 - a complete line (newline-terminated) that does not parse as a log entry —
   including blank lines;
@@ -112,9 +116,17 @@ offset:
   entries run a few hundred bytes);
 - a cleanly terminated gzip member that ends mid-line or contains a complete
   non-parsing line;
+- a gzip member whose body decodes in full but whose CRC or length trailer
+  does not match — an interrupted write cannot produce a complete trailer
+  with wrong values, so that shape is corruption, not truncation;
 - gzip content after a member that failed to decode (unreachable in practice —
   decoding stops there — but stated for completeness: bytes past `CleanSize`
   are ignored, never interpreted).
+
+A gzip file cut short inside its very first header is an interrupted first
+write and yields `ErrNoLogs`, like its plain equivalent. A header whose bytes
+beyond the magic are corrupt is indistinguishable from that and is classified
+the same way — a documented, tolerated misclassification.
 
 Refusal is deliberate: for an archival artifact, silently cutting away content
 the tool never wrote is worse than stopping. The operator decides what a
@@ -174,7 +186,12 @@ The saver goroutine's error must reach `RunE`'s return value:
 - After `wg.Wait()`, the saver's error is joined into the returned error: a
   failed save always exits non-zero. On a gzip destination the writer's
   `Close` finalizes the member, so its error is part of the save result, not
-  noise. A save error caused only by cancellation is not double-reported.
+  noise. A save error caused only by cancellation is not double-reported —
+  and "only" is literal: a cancellation joined with a real close error still
+  counts as a failure. When the saver itself cancelled the run, the return is
+  the save error alone, even if the fetcher's echo of that cancellation wins
+  the select — an internal failure is never dressed up as a user
+  cancellation.
 - The goroutine still logs the error when it happens, so the operator sees it
   immediately.
 
