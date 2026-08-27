@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -54,19 +54,20 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 				if cmd.Flags().Changed("start") {
 					c.log.Warning("--start is ignored when --resume is set", "resumeFile", resumeFile)
 				}
-				if cmd.Flags().Changed("output") {
-					c.log.Warning("--output is ignored when --resume is set, logs are appended to the resume file", "resumeFile", resumeFile)
-				}
-				if cursor.Compressed && compress {
-					c.log.Warning("--compress is ignored when resuming an already compressed file", "resumeFile", resumeFile)
+				if compress {
+					c.log.Warning("--compress is ignored when resuming; resume a compressed file to get a compressed result", "resumeFile", resumeFile)
 					compress = false
 				}
+				// An unset --output means in-place; so does naming the input.
+				if !cmd.Flags().Changed("output") || filepath.Clean(outputFile) == filepath.Clean(resumeFile) {
+					outputFile = resumeFile
+				}
 
-				outputFile = resumeFile
 				startBlock = cursor.BlockNumber
 
 				c.log.Info("Resuming export",
 					"resumeFile", resumeFile,
+					"outputFile", outputFile,
 					"startBlock", startBlock,
 					"lastLogIndex", cursor.LogIndex,
 					"compressed", cursor.Compressed,
@@ -97,8 +98,18 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 				startBlock = chainCfg.PostageStampStartBlock
 			}
 
-			if err := c.discardPartialWrite(outputFile, cursor); err != nil {
-				return err
+			if cursor != nil {
+				discarded, err := resume.PrepareOutput(cursor, resumeFile, outputFile)
+				if err != nil {
+					return err
+				}
+				if discarded > 0 {
+					c.log.Warning("previous export ends with an interrupted write, leaving it out",
+						"resumeFile", resumeFile,
+						"offset", cursor.CleanSize,
+						"discardedBytes", discarded,
+					)
+				}
 			}
 
 			// Opened before the first log is fetched: from inside the saving
@@ -187,42 +198,9 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 	cmd.Flags().Uint32VarP(&blockRangeLimit, "block-range-limit", "b", 5, "Max blocks per log query")
 	cmd.Flags().StringVarP(&outputFile, "output", "o", "export.ndjson", "Output file path (NDJSON)")
 	cmd.Flags().BoolVarP(&compress, "compress", "c", false, "Compress to GZIP")
-	cmd.Flags().StringVarP(&resumeFile, "resume", "r", "", "Resume a previous export file (.ndjson, .gz or .gzip); overrides --start and --output")
+	cmd.Flags().StringVarP(&resumeFile, "resume", "r", "", "Continue a previous export file (.ndjson, .gz or .gzip); combine with --output to write a new snapshot instead of appending in place")
 
 	c.root.AddCommand(cmd)
-
-	return nil
-}
-
-// discardPartialWrite drops the tail an interrupted run left in the resume
-// file, so logs are appended onto a boundary the reader positively identified
-// rather than onto half a line or half a gzip member. Nothing recoverable is
-// lost: everything discarded falls at or after the cursor and is re-fetched.
-//
-// It is a no-op without a resume file or when the file ends cleanly, and never
-// truncates past the offset the reader reported.
-func (c *command) discardPartialWrite(outputFile string, cursor *resume.Cursor) error {
-	if cursor == nil || !cursor.Truncated {
-		return nil
-	}
-
-	info, err := os.Stat(outputFile)
-	if err != nil {
-		return fmt.Errorf("failed to inspect resume file: %w", err)
-	}
-	if info.Size() <= cursor.CleanSize {
-		return nil
-	}
-
-	c.log.Warning("resume file ends with a partial write, discarding it",
-		"resumeFile", outputFile,
-		"offset", cursor.CleanSize,
-		"discardedBytes", info.Size()-cursor.CleanSize,
-	)
-
-	if err := os.Truncate(outputFile, cursor.CleanSize); err != nil {
-		return fmt.Errorf("failed to truncate resume file: %w", err)
-	}
 
 	return nil
 }
