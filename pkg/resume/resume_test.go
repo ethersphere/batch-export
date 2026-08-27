@@ -778,6 +778,95 @@ func TestCopyResumeFromInterruptedInput(t *testing.T) {
 	}
 }
 
+// TestPrepareOutputSameFileUnderDifferentSpellings pins Fix 1: two spellings
+// of the SAME underlying file — an absolute path against a relative one, or a
+// symlink pointed at the input — must be treated as in-place, not copy mode.
+// Before the fix, PrepareOutput compared filepath.Clean strings, missed both
+// cases, and its os.Create(outputPath) truncated the input to zero bytes
+// before io.CopyN ever got to read from it, destroying the file it was
+// supposed to leave untouched.
+//
+// Each case covers both a clean input (must survive byte for byte) and one
+// with an interrupted final write (must be truncated to exactly CleanSize,
+// the same result prepareInPlace produces for a same-path call).
+func TestPrepareOutputSameFileUnderDifferentSpellings(t *testing.T) {
+	logs := ndjson(t, testLog(100, 0), testLog(101, 0))
+	interrupted := append(append([]byte{}, logs...), []byte(`{"address":"0x45a1502382541`)...)
+
+	contents := []struct {
+		name    string
+		content []byte
+	}{
+		{name: "clean input", content: logs},
+		{name: "interrupted write", content: interrupted},
+	}
+
+	// spelling produces an outputPath that names the same file as input by
+	// some route other than an identical string.
+	spellings := []struct {
+		name    string
+		outPath func(t *testing.T, dir, input string) string
+	}{
+		{
+			// t.Chdir affects the whole process, so this case (and therefore
+			// the whole test) cannot run in parallel with anything else.
+			name: "absolute input, relative output",
+			outPath: func(t *testing.T, dir, input string) string {
+				t.Chdir(dir)
+				return filepath.Base(input)
+			},
+		},
+		{
+			name: "symlink to the input",
+			outPath: func(t *testing.T, dir, input string) string {
+				link := filepath.Join(dir, "alias-of-input")
+				if err := os.Symlink(input, link); err != nil {
+					t.Skipf("symlinks unsupported on this filesystem: %v", err)
+				}
+				return link
+			},
+		},
+	}
+
+	for _, ct := range contents {
+		for _, sp := range spellings {
+			t.Run(ct.name+"/"+sp.name, func(t *testing.T) {
+				dir := t.TempDir()
+				input := filepath.Join(dir, "snapshot.ndjson")
+				if err := os.WriteFile(input, ct.content, 0o644); err != nil {
+					t.Fatalf("write input: %v", err)
+				}
+
+				cursor, err := resume.Read(input)
+				if err != nil {
+					t.Fatalf("Read() error = %v", err)
+				}
+
+				output := sp.outPath(t, dir, input)
+
+				discarded, err := resume.PrepareOutput(cursor, input, output)
+				if err != nil {
+					t.Fatalf("PrepareOutput() error = %v", err)
+				}
+
+				wantDiscarded := int64(len(ct.content)) - cursor.CleanSize
+				if discarded != wantDiscarded {
+					t.Errorf("discarded = %d, want %d", discarded, wantDiscarded)
+				}
+
+				got, err := os.ReadFile(input)
+				if err != nil {
+					t.Fatalf("read input: %v", err)
+				}
+				want := ct.content[:cursor.CleanSize]
+				if !bytes.Equal(got, want) {
+					t.Fatalf("input holds %d bytes, want the %d-byte clean prefix preserved (copy mode must not have truncated the input)", len(got), len(want))
+				}
+			})
+		}
+	}
+}
+
 // TestResumeAfterInterruptedWrite covers the three shapes a run killed
 // mid-write leaves behind: a plain line cut in half, a plain line that parses
 // but never got its newline, and a gzip member that never got its trailer.

@@ -43,7 +43,7 @@ No new flags. `--resume` names the **input** (the previous snapshot);
 | `export` | Fresh export to `--output` (default `export.ndjson`). Unchanged. |
 | `export --resume old.gzip` | **In-place**: append to `old.gzip` itself. An unset `--output` does not redirect the result to its default. |
 | `export --resume old.gzip --output new.gzip` | **Copy mode**: `old.gzip` is never modified; `new.gzip` = clean content of `old.gzip` + newly fetched entries. |
-| `export --resume f --output f` | Identical paths (`filepath.Clean` equality) mean in-place. Distinct spellings of one file (symlinks, hardlinks) are the operator's responsibility. |
+| `export --resume f --output f` | Identical paths (`filepath.Clean` equality) mean in-place. Same file under any other spelling — absolute vs. relative, a symlink, a hardlink, two names a case-insensitive filesystem folds together — is detected via `os.SameFile` (device+inode) and also treated as in-place. |
 
 Flag interactions when `--resume` is set:
 

@@ -63,13 +63,17 @@ func (c *Cursor) Skip(l types.Log) bool {
 }
 
 // PrepareOutput readies outputPath for appending the continuation of the
-// export at inputPath. With equal paths the file is prepared in place: an
-// interrupted final write, if any, is truncated away. With distinct paths the
-// input is never modified: its clean content is copied raw into outputPath,
-// replacing whatever was there, and the interrupted tail is simply not
-// copied. Either way it returns how many trailing bytes were left out —
-// every entry they held falls at or after the cursor, so the resumed query
-// fetches it again.
+// export at inputPath. The same file is prepared in place: an interrupted
+// final write, if any, is truncated away. "Same file" is not lexical — a
+// relative and an absolute spelling of one path, a symlink or hardlink, or
+// two names a case-insensitive filesystem folds together all count, detected
+// via os.SameFile (device+inode), because os.Create on a distinct-looking
+// spelling of the input would truncate it before it could be copied from.
+// With genuinely distinct files the input is never modified: its clean
+// content is copied raw into outputPath, replacing whatever was there, and
+// the interrupted tail is simply not copied. Either way it returns how many
+// trailing bytes were left out — every entry they held falls at or after the
+// cursor, so the resumed query fetches it again.
 func PrepareOutput(c *Cursor, inputPath, outputPath string) (int64, error) {
 	if filepath.Clean(inputPath) == filepath.Clean(outputPath) {
 		return prepareInPlace(c, inputPath)
@@ -84,6 +88,13 @@ func PrepareOutput(c *Cursor, inputPath, outputPath string) (int64, error) {
 	info, err := in.Stat()
 	if err != nil {
 		return 0, fmt.Errorf("error inspecting resume file: %w", err)
+	}
+
+	// The same file under two names — relative vs absolute, a symlink or
+	// hardlink, a case-insensitive filesystem — is in-place, not copy mode:
+	// os.Create would truncate the input we are about to read.
+	if outInfo, err := os.Stat(outputPath); err == nil && os.SameFile(info, outInfo) {
+		return prepareInPlace(c, inputPath)
 	}
 
 	out, err := os.Create(outputPath)
