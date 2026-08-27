@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -59,6 +60,68 @@ func (c *Cursor) Skip(l types.Log) bool {
 		return l.BlockNumber < c.BlockNumber
 	}
 	return l.Index <= c.LogIndex
+}
+
+// PrepareOutput readies outputPath for appending the continuation of the
+// export at inputPath. With equal paths the file is prepared in place: an
+// interrupted final write, if any, is truncated away. With distinct paths the
+// input is never modified: its clean content is copied raw into outputPath,
+// replacing whatever was there, and the interrupted tail is simply not
+// copied. Either way it returns how many trailing bytes were left out —
+// every entry they held falls at or after the cursor, so the resumed query
+// fetches it again.
+func PrepareOutput(c *Cursor, inputPath, outputPath string) (int64, error) {
+	if filepath.Clean(inputPath) == filepath.Clean(outputPath) {
+		return prepareInPlace(c, inputPath)
+	}
+
+	in, err := os.Open(inputPath)
+	if err != nil {
+		return 0, fmt.Errorf("error opening resume file: %w", err)
+	}
+	defer in.Close()
+
+	info, err := in.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("error inspecting resume file: %w", err)
+	}
+
+	out, err := os.Create(outputPath)
+	if err != nil {
+		return 0, fmt.Errorf("error creating output file: %w", err)
+	}
+
+	_, err = io.CopyN(out, in, c.CleanSize)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return 0, fmt.Errorf("error copying clean content to output file: %w", err)
+	}
+
+	return info.Size() - c.CleanSize, nil
+}
+
+// prepareInPlace drops the interrupted tail so appending continues from the
+// clean boundary. It never truncates past the offset the reader identified.
+func prepareInPlace(c *Cursor, path string) (int64, error) {
+	if !c.Truncated {
+		return 0, nil
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, fmt.Errorf("error inspecting resume file: %w", err)
+	}
+	if info.Size() <= c.CleanSize {
+		return 0, nil
+	}
+
+	if err := os.Truncate(path, c.CleanSize); err != nil {
+		return 0, fmt.Errorf("error truncating resume file: %w", err)
+	}
+
+	return info.Size() - c.CleanSize, nil
 }
 
 // cursorLine is the part of an exported log line a cursor is built from. Both

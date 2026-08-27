@@ -26,6 +26,12 @@ const (
 	gzipFile  = "export.ndjson.gzip"
 )
 
+// Format names reused across several tables of test cases.
+const (
+	nameFormatPlain = "plain ndjson"
+	nameFormatGzip  = "gzip"
+)
+
 // testLog builds a log shaped like the ones the exporter writes. types.Log
 // always marshals blockNumber and logIndex, even at zero.
 func testLog(blockNumber uint64, logIndex uint) types.Log {
@@ -118,7 +124,7 @@ func TestReadCursor(t *testing.T) {
 		wantCleanSize int64
 	}{
 		{
-			name:      "plain ndjson",
+			name:      nameFormatPlain,
 			content:   threeLogs,
 			wantBlock: 102,
 			wantIndex: 7,
@@ -159,7 +165,7 @@ func TestReadCursor(t *testing.T) {
 			wantIndex: 15,
 		},
 		{
-			name:           "gzip",
+			name:           nameFormatGzip,
 			content:        gz(t, threeLogs),
 			wantBlock:      102,
 			wantIndex:      7,
@@ -418,8 +424,8 @@ func TestAppendResumeRoundTrip(t *testing.T) {
 		name       string
 		compressed bool
 	}{
-		{name: "plain ndjson"},
-		{name: "gzip", compressed: true},
+		{name: nameFormatPlain},
+		{name: nameFormatGzip, compressed: true},
 	}
 
 	for _, tt := range tests {
@@ -611,6 +617,167 @@ func feed(logs ...types.Log) <-chan types.Log {
 	return ch
 }
 
+// TestCopyResumeRoundTrip is the spec's recommended workflow (§4): resume an
+// archived snapshot into a NEW file. The input must come out byte-identical;
+// the output must hold the input's content plus exactly the new entries and
+// be itself resumable.
+func TestCopyResumeRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		compressed bool
+	}{
+		{name: nameFormatPlain},
+		{name: nameFormatGzip, compressed: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			original := []types.Log{testLog(100, 0), testLog(101, 0), testLog(102, 0), testLog(102, 1)}
+			boundaryHigher := testLog(102, 2)
+			newer := []types.Log{testLog(103, 0), testLog(104, 0)}
+
+			inputBytes := ndjson(t, original...)
+			if tt.compressed {
+				inputBytes = gz(t, inputBytes)
+			}
+			dir := t.TempDir()
+			input := filepath.Join(dir, "prev.snapshot")
+			output := filepath.Join(dir, "next.snapshot")
+			if err := os.WriteFile(input, inputBytes, 0o644); err != nil {
+				t.Fatalf("write input: %v", err)
+			}
+
+			cursor, err := resume.Read(input)
+			if err != nil {
+				t.Fatalf("Read() error = %v", err)
+			}
+
+			discarded, err := resume.PrepareOutput(cursor, input, output)
+			if err != nil {
+				t.Fatalf("PrepareOutput() error = %v", err)
+			}
+			if discarded != 0 {
+				t.Errorf("discarded = %d, want 0 for a clean input", discarded)
+			}
+
+			w := appendWriter(t, output, cursor)
+			replay := []types.Log{testLog(102, 0), testLog(102, 1), boundaryHigher}
+			replay = append(replay, newer...)
+			if err := filestore.AppendLogsAsync(t.Context(), feed(replay...), w, cursor.Skip); err != nil {
+				t.Fatalf("AppendLogsAsync() error = %v", err)
+			}
+
+			// The input is untouched, byte for byte.
+			gotInput, err := os.ReadFile(input)
+			if err != nil {
+				t.Fatalf("read input: %v", err)
+			}
+			if !bytes.Equal(gotInput, inputBytes) {
+				t.Fatal("input file was modified by a copy-mode resume")
+			}
+
+			// The output begins with the input's exact bytes (raw prefix
+			// copy, no recompression) and holds the full sequence.
+			gotOutput, err := os.ReadFile(output)
+			if err != nil {
+				t.Fatalf("read output: %v", err)
+			}
+			if len(gotOutput) < len(inputBytes) || !bytes.Equal(gotOutput[:len(inputBytes)], inputBytes) {
+				t.Fatal("input bytes are not an unchanged prefix of the output")
+			}
+			all := append(append(append([]types.Log{}, original...), boundaryHigher), newer...)
+			if got, want := ids(logsIn(t, output)), ids(all); !slices.Equal(got, want) {
+				t.Fatalf("output logs = %v, want %v", got, want)
+			}
+
+			cursor2, err := resume.Read(output)
+			if err != nil {
+				t.Fatalf("Read(output) error = %v", err)
+			}
+			if cursor2.BlockNumber != 104 || cursor2.LogIndex != 0 || cursor2.Truncated {
+				t.Errorf("output cursor = {%d,%d,truncated=%t}, want {104,0,false}", cursor2.BlockNumber, cursor2.LogIndex, cursor2.Truncated)
+			}
+		})
+	}
+}
+
+// TestCopyResumeFromInterruptedInput: copy mode never repairs the input — the
+// interrupted tail stays in it — while the output gets only clean content
+// plus the re-fetched entries.
+func TestCopyResumeFromInterruptedInput(t *testing.T) {
+	t.Parallel()
+
+	saved := ndjson(t, testLog(100, 0), testLog(101, 0))
+
+	tests := []struct {
+		name       string
+		content    []byte
+		compressed bool
+	}{
+		{
+			name:    "plain with a truncated last line",
+			content: append(append([]byte{}, saved...), []byte(`{"address":"0x45a15`)...),
+		},
+		{
+			name:       "gzip with a truncated final member",
+			content:    append(gz(t, saved), truncateLast(gz(t, ndjson(t, testLog(102, 0))), 6)...),
+			compressed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			input := filepath.Join(dir, "prev.snapshot")
+			output := filepath.Join(dir, "next.snapshot")
+			if err := os.WriteFile(input, tt.content, 0o644); err != nil {
+				t.Fatalf("write input: %v", err)
+			}
+
+			cursor, err := resume.Read(input)
+			if err != nil {
+				t.Fatalf("Read() error = %v", err)
+			}
+			if !cursor.Truncated {
+				t.Fatal("test setup: input should be truncated")
+			}
+
+			discarded, err := resume.PrepareOutput(cursor, input, output)
+			if err != nil {
+				t.Fatalf("PrepareOutput() error = %v", err)
+			}
+			if want := int64(len(tt.content)) - cursor.CleanSize; discarded != want {
+				t.Errorf("discarded = %d, want %d", discarded, want)
+			}
+
+			w := appendWriter(t, output, cursor)
+			replay := []types.Log{testLog(101, 0), testLog(102, 0), testLog(103, 0)}
+			if err := filestore.AppendLogsAsync(t.Context(), feed(replay...), w, cursor.Skip); err != nil {
+				t.Fatalf("AppendLogsAsync() error = %v", err)
+			}
+
+			gotInput, err := os.ReadFile(input)
+			if err != nil {
+				t.Fatalf("read input: %v", err)
+			}
+			if !bytes.Equal(gotInput, tt.content) {
+				t.Fatal("input was modified, interrupted tail included it must stay")
+			}
+
+			want := []types.Log{testLog(100, 0), testLog(101, 0), testLog(102, 0), testLog(103, 0)}
+			if got := ids(logsIn(t, output)); !slices.Equal(got, ids(want)) {
+				t.Fatalf("output logs = %v, want %v", got, ids(want))
+			}
+		})
+	}
+}
+
 // TestResumeAfterInterruptedWrite covers the three shapes a run killed
 // mid-write leaves behind: a plain line cut in half, a plain line that parses
 // but never got its newline, and a gzip member that never got its trailer.
@@ -709,8 +876,8 @@ func TestResumeAfterInterruptedWrite(t *testing.T) {
 
 			// Recovery: drop the partial tail, exactly as the export command
 			// does, and never further than the reported boundary.
-			if err := os.Truncate(path, cursor.CleanSize); err != nil {
-				t.Fatalf("truncate %s: %v", path, err)
+			if _, err := resume.PrepareOutput(cursor, path, path); err != nil {
+				t.Fatalf("PrepareOutput() error = %v", err)
 			}
 
 			if err := filestore.AppendLogsAsync(t.Context(), feed(tt.replay...), appendWriter(t, path, cursor), cursor.Skip); err != nil {
