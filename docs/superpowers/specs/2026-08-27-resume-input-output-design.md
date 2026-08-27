@@ -131,9 +131,11 @@ manipulated file means.
 (`ErrNoCleanBoundary` is retired: its gzip case — a sole truncated member — is
 `ErrNoLogs`; its mid-line-member case is `ErrNotAnExport`.)
 
-**Mechanics.** Plain: one read of the last `maxLineBytes` bytes suffices —
-find the last newline, check the fragment after it, parse the single line
-before it. The current multi-window backward walk with carry exists only to
+**Mechanics.** Plain: one read of the last `2*maxLineBytes` bytes suffices —
+enough for the last complete line plus a trailing fragment, up to
+`maxLineBytes` (1 MiB) each — to find the last newline, check the fragment
+after it, and parse the single line before it. The current multi-window
+backward walk with carry exists only to
 tolerate foreign junk and is deleted. Gzip: cannot seek, so the stream is
 decoded member by member with a counting reader (which must implement
 `io.ByteReader` so `gzip.Reader` consumes it directly and member boundaries

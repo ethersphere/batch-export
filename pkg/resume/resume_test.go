@@ -867,6 +867,40 @@ func TestPrepareOutputSameFileUnderDifferentSpellings(t *testing.T) {
 	}
 }
 
+// TestReadRejectsCorruptedChecksum pins Fix 3: a member whose body is intact
+// but whose trailing CRC has been altered is corruption or tampering, not the
+// tool's own interrupted write, and must be refused with ErrNotAnExport
+// rather than silently treated as a truncated final member.
+func TestReadRejectsCorruptedChecksum(t *testing.T) {
+	t.Parallel()
+
+	content := gz(t, ndjson(t, testLog(100, 0), testLog(101, 0)))
+	// The trailer is the last 8 bytes: a 4-byte CRC32 followed by a 4-byte
+	// ISIZE. Flipping a byte within the first 4 corrupts the CRC alone,
+	// leaving the member body and its length untouched.
+	content[len(content)-8] ^= 0xff
+
+	_, err := resume.Read(write(t, gzipFile, content))
+	if !errors.Is(err, resume.ErrNotAnExport) {
+		t.Fatalf("Read() error = %v, want ErrNotAnExport", err)
+	}
+}
+
+// TestReadGzipCutInsideHeader pins Fix 4: a file cut short before the gzip
+// header is even complete is an interrupted first write, exactly like the
+// plain format's equivalent, and must report ErrNoLogs rather than a bare
+// wrapped error that escapes the two-sentinel taxonomy.
+func TestReadGzipCutInsideHeader(t *testing.T) {
+	t.Parallel()
+
+	full := gz(t, ndjson(t, testLog(100, 0)))
+
+	_, err := resume.Read(write(t, gzipFile, full[:5]))
+	if !errors.Is(err, resume.ErrNoLogs) {
+		t.Fatalf("Read() error = %v, want ErrNoLogs", err)
+	}
+}
+
 // TestResumeAfterInterruptedWrite covers the three shapes a run killed
 // mid-write leaves behind: a plain line cut in half, a plain line that parses
 // but never got its newline, and a gzip member that never got its trailer.

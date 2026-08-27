@@ -219,7 +219,7 @@ func lastCursorPlain(file *os.File, size int64) (*Cursor, error) {
 		// No newline at all: an interrupted first write, unless the file is
 		// longer than any single line the tool writes.
 		if size > maxLineBytes {
-			return nil, fmt.Errorf("%w: %d bytes without a newline", ErrNotAnExport, size)
+			return nil, fmt.Errorf("%w: no newline in the final %d bytes (from offset %d)", ErrNotAnExport, window, offset)
 		}
 		return nil, ErrNoLogs
 	}
@@ -252,7 +252,14 @@ func lastCursorGzip(file *os.File) (*Cursor, error) {
 
 	reader, err := gzip.NewReader(counter)
 	if err != nil {
-		return nil, fmt.Errorf("error opening gzip resume file: %w", err)
+		// isGzip already confirmed the magic bytes, so failure here means the
+		// file was cut inside the 10-byte header (truncation-shaped, like the
+		// plain format's interrupted-first-write case) or the header past the
+		// magic bytes is corrupt (tampering).
+		if truncationShaped(err) {
+			return nil, ErrNoLogs
+		}
+		return nil, fmt.Errorf("%w: gzip header: %w", ErrNotAnExport, err)
 	}
 	defer reader.Close()
 
@@ -260,18 +267,19 @@ func lastCursorGzip(file *os.File) (*Cursor, error) {
 		cursor    *Cursor
 		cleanSize int64
 		sawClean  bool
+		member    = 1
 	)
 	for {
 		// Reset turns multistream back on, so it must be switched off per
 		// member, not just for the first.
 		reader.Multistream(false)
 
-		last, err := scanMember(reader)
+		last, err := scanMember(reader, member)
 		switch {
 		case errors.Is(err, ErrNotAnExport):
 			return nil, err
 		case err != nil && !truncationShaped(err):
-			return nil, fmt.Errorf("error reading gzip resume file: %w", err)
+			return nil, fmt.Errorf("%w: member %d: %w", ErrNotAnExport, member, err)
 		case err != nil:
 			// The member never got its trailer: an interrupted final write.
 			return gzipResult(cursor, cleanSize, sawClean)
@@ -290,6 +298,7 @@ func lastCursorGzip(file *os.File) (*Cursor, error) {
 			}
 			return nil, fmt.Errorf("error reading gzip resume file: %w", err)
 		}
+		member++
 	}
 }
 
@@ -306,12 +315,20 @@ func gzipResult(cursor *Cursor, cleanSize int64, sawClean bool) (*Cursor, error)
 
 // truncationShaped reports whether err is what an interrupted write produces,
 // as opposed to a real read failure that must not be mistaken for one.
+//
+// gzip.ErrChecksum is deliberately excluded: an interrupted write cannot
+// produce a full-length member body plus a complete 8-byte trailer that then
+// holds the wrong CRC — that shape is corruption or tampering, not
+// truncation, so callers classify it ErrNotAnExport instead. One side effect:
+// a genuine I/O error from the underlying file that happens to look like
+// corruption is also classified ErrNotAnExport, since it is rare and
+// indistinguishable at this layer; §5's strictness favors refusal over
+// guessing.
 func truncationShaped(err error) bool {
 	var corrupt flate.CorruptInputError
 
 	return errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, gzip.ErrHeader) ||
-		errors.Is(err, gzip.ErrChecksum) ||
 		errors.As(err, &corrupt)
 }
 
@@ -321,18 +338,24 @@ func truncationShaped(err error) bool {
 // holding whole log lines only, so a complete line that does not parse, or a
 // clean member ending mid-line, is foreign content (ErrNotAnExport); any
 // other read error is returned as-is for the caller to classify.
-func scanMember(r io.Reader) (*Cursor, error) {
+//
+// member is this member's 1-based position in the file, threaded through
+// purely so a refusal can name where the offending line lives — a file with
+// tens of thousands of lines split across gzip members otherwise gives the
+// operator nothing to search for.
+func scanMember(r io.Reader, member int) (*Cursor, error) {
 	buffered := bufio.NewReaderSize(r, bufferSize)
 
 	var (
-		last *Cursor
-		line []byte
+		last    *Cursor
+		line    []byte
+		lineNum = 1
 	)
 	for {
 		chunk, err := buffered.ReadSlice('\n')
 		line = append(line, chunk...)
 		if len(line) > maxLineBytes {
-			return nil, fmt.Errorf("%w: line exceeds %d bytes", ErrNotAnExport, maxLineBytes)
+			return nil, fmt.Errorf("%w: member %d, line %d exceeds %d bytes", ErrNotAnExport, member, lineNum, maxLineBytes)
 		}
 
 		switch {
@@ -340,7 +363,7 @@ func scanMember(r io.Reader) (*Cursor, error) {
 			continue
 		case errors.Is(err, io.EOF):
 			if len(line) > 0 {
-				return nil, fmt.Errorf("%w: gzip member ends mid-line", ErrNotAnExport)
+				return nil, fmt.Errorf("%w: member %d, line %d ends mid-line", ErrNotAnExport, member, lineNum)
 			}
 			return last, nil
 		case err != nil:
@@ -349,10 +372,11 @@ func scanMember(r io.Reader) (*Cursor, error) {
 
 		cursor, err := parseCursor(line)
 		if err != nil {
-			return nil, fmt.Errorf("%w: line is not a log entry: %w", ErrNotAnExport, err)
+			return nil, fmt.Errorf("%w: member %d, line %d is not a log entry: %w", ErrNotAnExport, member, lineNum, err)
 		}
 		last = cursor
 		line = line[:0]
+		lineNum++
 	}
 }
 
