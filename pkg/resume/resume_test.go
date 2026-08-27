@@ -99,7 +99,9 @@ func TestReadCursor(t *testing.T) {
 
 	threeLogs := ndjson(t, testLog(100, 0), testLog(101, 1), testLog(102, 7))
 
-	// many spans several 64 KiB backward-read windows.
+	// many is large enough to span several of the gzip path's 64 KiB member
+	// buffers, exercising the buffered scan across bufio.ReadSlice refills
+	// rather than a single in-memory read.
 	manyLogs := make([]types.Log, 0, 2000)
 	for i := range 2000 {
 		manyLogs = append(manyLogs, testLog(uint64(1000+i), uint(i%16)))
@@ -999,8 +1001,12 @@ func TestResumeAfterInterruptedWrite(t *testing.T) {
 
 			// Recovery: drop the partial tail, exactly as the export command
 			// does, and never further than the reported boundary.
-			if _, err := resume.PrepareOutput(cursor, path, path); err != nil {
+			discarded, err := resume.PrepareOutput(cursor, path, path)
+			if err != nil {
 				t.Fatalf("PrepareOutput() error = %v", err)
+			}
+			if want := int64(len(tt.content)) - cursor.CleanSize; discarded != want {
+				t.Errorf("discarded = %d, want %d", discarded, want)
 			}
 
 			if err := filestore.AppendLogsAsync(t.Context(), feed(tt.replay...), appendWriter(t, path, cursor), cursor.Skip); err != nil {

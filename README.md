@@ -13,7 +13,7 @@ batch-export is a tool to retrieve Ethereum event logs for specific contracts, p
 
 ## Requirements
 
-- Go 1.24 or later
+- Go 1.25 or later
 
 ## Installation
 
@@ -45,7 +45,7 @@ The primary command is export.
 ```sh
   -b, --block-range-limit uint32   Max blocks per log query (default 5)
   -c, --compress                   Compress to GZIP
-      --end uint                   End block (optional, uses latest block if 0) (default 39810670)
+      --end uint                   End block (optional, uses latest block if 0)
   -e, --endpoint string            Ethereum RPC endpoint URL
   -h, --help                       help for export
   -m, --max-request int            Max RPC requests/sec (default 15)
@@ -66,6 +66,9 @@ blocks exported since:
 ./dist/batch-export export --resume snapshots/2026-07.gzip --output snapshots/2026-08.gzip
 ```
 
+If `--output` already names an existing file, it is overwritten — the same
+`os.Create` semantics as a fresh export, so pick a new name for each snapshot.
+
 Formats are detected by content, not extension: `.ndjson`, `.gz` and `.gzip`
 all work, and the output's format always matches the input's. Omitting
 `--output` (or naming the input) appends to the previous file in place — the
@@ -75,12 +78,14 @@ space-saving variant:
 ./dist/batch-export export --resume export.ndjson.gzip
 ```
 
-The last exported block is re-queried and entries already present are
-skipped, so continuing neither duplicates nor drops a log. Each continuation
-of a compressed snapshot adds a gzip member — standard tools (`gzcat`,
-`gunzip`, Go, Python) read multi-member files as one stream, a year of
-monthly continuations costs about 0.02% in size, and
-`gzcat old.gzip | gzip > fresh.gzip` consolidates the members any time.
+`--start` is ignored (with a warning) when `--resume` is set: the cursor in
+the previous file decides where the fetch resumes. The last exported block is
+re-queried and entries already present are skipped, so continuing neither
+duplicates nor drops a log. Each continuation of a compressed snapshot adds a
+gzip member — standard tools (`gzcat`, `gunzip`, Go, Python) read
+multi-member files as one stream, a year of monthly continuations costs about
+0.02% in size, and `gzcat old.gzip | gzip > fresh.gzip` consolidates the
+members any time.
 
 Keep one canonical snapshot file. `--compress` is ignored when resuming:
 regenerating a `.gzip` from a plain twin is how an independently continued
@@ -95,6 +100,9 @@ mid-export): in copy mode it is simply not copied, in place it is truncated
 away with a warning, and its entries are re-fetched. Note that resuming does
 not detect a file from a different chain; pairing the snapshot with the
 right `--endpoint` is the operator's contract.
+
+If a copy-mode run itself is interrupted or fails, the input was never
+touched — delete the incomplete `--output` file and rerun.
 
 The produced NDJSON is consumed by [batch-archive](https://github.com/ethersphere/batch-archive), which embeds it for use inside Bee.
 

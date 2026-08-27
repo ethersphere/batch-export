@@ -186,7 +186,7 @@ The saver goroutine's error must reach `RunE`'s return value:
    one-liner.
 3. A short "if the previous run was interrupted" subsection: copy mode —
    rerun; in-place — the tool truncates the interrupted write and re-fetches,
-   warning shown. A fusnote, not the headline.
+   warning shown. A footnote, not the headline.
 4. The trust rule, stated plainly: resume only files this tool produced; a
    file with any other content is refused, and resuming does not detect a
    wrong chain — that is the operator's contract.
@@ -212,7 +212,8 @@ The saver goroutine's error must reach `RunE`'s return value:
 - `pkg/filestore`: `SaveLogsAsync` — exported, no production caller — is
   deleted with its tests; fresh exports route through `CreateWriter` +
   `AppendLogsAsync`. The `AppendLogsAsync` close-error join stays.
-- `pkg/gzipstore`: unchanged.
+- `pkg/gzipstore`: gained `AppendWriter` earlier on this branch (§6); not
+  further changed by this design.
 
 ## 10. Testing
 
