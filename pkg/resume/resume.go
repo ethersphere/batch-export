@@ -5,6 +5,7 @@ package resume
 import (
 	"bufio"
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
 	"encoding/json"
 	"errors"
@@ -17,24 +18,21 @@ import (
 )
 
 const (
-	// windowSize is how much of a plain NDJSON file is read per backward step.
-	windowSize = 64 * 1024
-	// maxLineBytes caps a single line, so a file without newlines is not read
-	// into memory whole. Exported log lines run to a few hundred bytes.
+	// maxLineBytes caps a single line. Exported log lines run to a few
+	// hundred bytes, so anything longer is not this tool's output.
 	maxLineBytes = 1 << 20
 	// bufferSize is how much of a gzip file is buffered per read.
 	bufferSize = 64 * 1024
 )
 
 var (
-	// ErrNoLogs indicates that a file holds no complete log entry.
+	// ErrNotAnExport indicates content this tool never writes. The file was
+	// altered after export, so resuming it is refused rather than repaired.
+	ErrNotAnExport = errors.New("not an untouched batch-export file")
+	// ErrNoLogs indicates a file consistent with tool output that holds no
+	// complete entry to resume from: it is empty, or holds only an
+	// interrupted first write. The remedy is a fresh export.
 	ErrNoLogs = errors.New("no complete log entry found")
-	// ErrNoCleanBoundary indicates that a file holds log entries but no offset
-	// at which appending is safe.
-	ErrNoCleanBoundary = errors.New("file was left partially written and has no clean boundary to append at")
-	// errLineTooLong indicates a line ran past maxLineBytes, so the data is not
-	// the NDJSON an export writes.
-	errLineTooLong = errors.New("log line exceeds the maximum length")
 )
 
 // Cursor marks the last log entry saved by a previous export, together with
@@ -78,8 +76,8 @@ type cursorLine struct {
 // a compressed one must sit in a member that decoded to a clean end of stream.
 // A caller that appends must first discard everything past CleanSize.
 //
-// It returns ErrNoLogs when there is no complete entry, and ErrNoCleanBoundary
-// when there are entries but no offset at which appending is safe.
+// It returns ErrNoLogs when there is no complete entry, and ErrNotAnExport
+// when the file holds content this tool did not write.
 func Read(path string) (*Cursor, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -128,76 +126,53 @@ func isGzip(file *os.File) (bool, error) {
 	return magic[0] == 0x1f && magic[1] == 0x8b, nil
 }
 
-// lastCursorPlain walks a plain NDJSON file backwards a window at a time and
-// returns a cursor for the last line that parses and ends in a newline.
-// json.Encoder writes a value and its newline in one call, so a trailing line
-// without one was cut short by an interrupted run and is passed over.
+// lastCursorPlain validates the tail of a plain NDJSON file and returns a
+// cursor for its last complete line. The tool writes one entry per line in a
+// single call, so only the tail needs examining: the last newline-terminated
+// line must parse as a log entry, and the only bytes allowed after it are a
+// single interrupted write — a trailing fragment with no newline.
 func lastCursorPlain(file *os.File, size int64) (*Cursor, error) {
-	var (
-		offset = size
-		// end is one past the last byte held in window; terminated reports
-		// whether the file byte at end is the newline closing that region's
-		// last line. Only a terminated region can yield a cursor.
-		end        = size
-		terminated bool
-		// carry holds the bytes before the window's first newline, belonging to
-		// a line that starts in the next window back.
-		carry []byte
-	)
+	window := min(size, 2*maxLineBytes)
+	offset := size - window
 
-	for offset > 0 {
-		n := int64(windowSize)
-		if offset < n {
-			n = offset
-		}
-		offset -= n
-
-		window := make([]byte, n)
-		if _, err := file.ReadAt(window, offset); err != nil {
-			return nil, fmt.Errorf("error reading resume file: %w", err)
-		}
-		window = append(window, carry...)
-
-		for {
-			i := bytes.LastIndexByte(window, '\n')
-			if i < 0 {
-				break
-			}
-			if terminated {
-				if cursor, err := parseCursor(window[i+1:]); err == nil {
-					cursor.CleanSize = end + 1
-					return cursor, nil
-				}
-			}
-			window = window[:i]
-			end, terminated = offset+int64(i), true
-		}
-
-		carry = window
-		if len(carry) > maxLineBytes {
-			return nil, ErrNoLogs
-		}
+	buf := make([]byte, window)
+	if _, err := file.ReadAt(buf, offset); err != nil {
+		return nil, fmt.Errorf("error reading resume file: %w", err)
 	}
 
-	if terminated {
-		if cursor, err := parseCursor(carry); err == nil {
-			cursor.CleanSize = end + 1
-			return cursor, nil
+	nl := bytes.LastIndexByte(buf, '\n')
+	if nl < 0 {
+		// No newline at all: an interrupted first write, unless the file is
+		// longer than any single line the tool writes.
+		if size > maxLineBytes {
+			return nil, fmt.Errorf("%w: %d bytes without a newline", ErrNotAnExport, size)
 		}
+		return nil, ErrNoLogs
+	}
+	if tail := window - int64(nl) - 1; tail > maxLineBytes {
+		return nil, fmt.Errorf("%w: %d bytes without a newline after offset %d", ErrNotAnExport, tail, offset+int64(nl)+1)
 	}
 
-	return nil, ErrNoLogs
+	start := bytes.LastIndexByte(buf[:nl], '\n') + 1
+	if start == 0 && offset > 0 {
+		return nil, fmt.Errorf("%w: final line is over %d bytes long", ErrNotAnExport, nl)
+	}
+	cursor, err := parseCursor(buf[start:nl])
+	if err != nil {
+		return nil, fmt.Errorf("%w: final complete line at offset %d is not a log entry: %w", ErrNotAnExport, offset+int64(start), err)
+	}
+	cursor.CleanSize = offset + int64(nl) + 1
+
+	return cursor, nil
 }
 
 // lastCursorGzip walks a gzip file one member at a time and returns a cursor
-// for the last log line inside a cleanly terminated member. Gzip cannot be
-// seeked, so the whole stream is decompressed.
-//
-// A half-written member has no CRC and length trailer, so it reports an error
-// rather than io.EOF; the walk stops there and CleanSize is the end of the last
-// member that did terminate cleanly, which is a valid place to concatenate the
-// next one. Lines are carried across members, so one split between two members
-// is still recognised and a member ending mid-line is not a boundary.
+// for the last entry inside the cleanly terminated prefix. Gzip cannot be
+// seeked, so the whole stream is decompressed; every complete line is
+// validated on the way. A member cut short by an interrupted write ends the
+// walk: CleanSize stays at the last clean member boundary, and the truncated
+// member's content — about to be discarded and re-fetched — never advances
+// the cursor.
 func lastCursorGzip(file *os.File) (*Cursor, error) {
 	counter := &countingReader{reader: bufio.NewReaderSize(file, bufferSize)}
 
@@ -208,85 +183,101 @@ func lastCursorGzip(file *os.File) (*Cursor, error) {
 	defer reader.Close()
 
 	var (
-		// clean is the cursor as of cleanSize; pending also covers the member
-		// being read and is promoted only once that member is known to have
-		// ended cleanly and on a line boundary.
-		clean, pending *Cursor
-		cleanSize      int64
-		carry          []byte
+		cursor    *Cursor
+		cleanSize int64
+		sawClean  bool
 	)
-
 	for {
 		// Reset turns multistream back on, so it must be switched off per
 		// member, not just for the first.
 		reader.Multistream(false)
 
-		cursor, tail, err := scanLines(reader, carry)
-		if cursor != nil {
-			pending = cursor
+		last, err := scanMember(reader)
+		switch {
+		case errors.Is(err, ErrNotAnExport):
+			return nil, err
+		case err != nil && !truncationShaped(err):
+			return nil, fmt.Errorf("error reading gzip resume file: %w", err)
+		case err != nil:
+			// The member never got its trailer: an interrupted final write.
+			return gzipResult(cursor, cleanSize, sawClean)
 		}
-		if err != nil {
-			// Member did not reach a clean end of stream, so everything it
-			// holds belongs to an interrupted write.
-			break
-		}
-		if len(tail) == 0 {
-			clean, cleanSize = pending, counter.read
-		}
-		carry = tail
 
-		// A clean end of file makes Reset report io.EOF; anything else is a
-		// partly written member header.
+		if last != nil {
+			cursor = last
+		}
+		cleanSize, sawClean = counter.read, true
+
+		// A clean end of file makes Reset report io.EOF; a partly written
+		// next member fails to parse as a header and also ends the walk.
 		if err := reader.Reset(counter); err != nil {
-			break
+			if errors.Is(err, io.EOF) || truncationShaped(err) {
+				return gzipResult(cursor, cleanSize, sawClean)
+			}
+			return nil, fmt.Errorf("error reading gzip resume file: %w", err)
 		}
 	}
-
-	if clean == nil {
-		if pending == nil {
-			return nil, ErrNoLogs
-		}
-		return nil, ErrNoCleanBoundary
-	}
-
-	clean.CleanSize = cleanSize
-
-	return clean, nil
 }
 
-// scanLines reads NDJSON from r and returns a cursor for the last line that
-// parses and ends in a newline. carry is prepended to the first line so a line
-// split across two gzip members is reassembled, and the unterminated trailing
-// bytes are returned for the next member to complete.
-//
-// The error is nil only when r reached a clean io.EOF. Truncation, a checksum
-// mismatch, an over-long line and an I/O failure are all reported, because each
-// means the bytes after the last good line cannot be trusted.
-func scanLines(r io.Reader, carry []byte) (*Cursor, []byte, error) {
+// gzipResult finalizes the walk: a file with no clean member, or none holding
+// an entry, has nothing to resume from.
+func gzipResult(cursor *Cursor, cleanSize int64, sawClean bool) (*Cursor, error) {
+	if !sawClean || cursor == nil {
+		return nil, ErrNoLogs
+	}
+	cursor.CleanSize = cleanSize
+
+	return cursor, nil
+}
+
+// truncationShaped reports whether err is what an interrupted write produces,
+// as opposed to a real read failure that must not be mistaken for one.
+func truncationShaped(err error) bool {
+	var corrupt flate.CorruptInputError
+
+	return errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, gzip.ErrHeader) ||
+		errors.Is(err, gzip.ErrChecksum) ||
+		errors.As(err, &corrupt)
+}
+
+// scanMember reads one gzip member's NDJSON and returns a cursor for its last
+// entry, nil when the member is empty. A nil error means the member decoded
+// to a clean end of stream on a line boundary. The tool writes members
+// holding whole log lines only, so a complete line that does not parse, or a
+// clean member ending mid-line, is foreign content (ErrNotAnExport); any
+// other read error is returned as-is for the caller to classify.
+func scanMember(r io.Reader) (*Cursor, error) {
 	buffered := bufio.NewReaderSize(r, bufferSize)
 
-	var last *Cursor
-
-	line := carry
+	var (
+		last *Cursor
+		line []byte
+	)
 	for {
 		chunk, err := buffered.ReadSlice('\n')
 		line = append(line, chunk...)
 		if len(line) > maxLineBytes {
-			return last, nil, errLineTooLong
+			return nil, fmt.Errorf("%w: line exceeds %d bytes", ErrNotAnExport, maxLineBytes)
 		}
 
 		switch {
 		case errors.Is(err, bufio.ErrBufferFull):
 			continue
 		case errors.Is(err, io.EOF):
-			return last, line, nil
+			if len(line) > 0 {
+				return nil, fmt.Errorf("%w: gzip member ends mid-line", ErrNotAnExport)
+			}
+			return last, nil
 		case err != nil:
-			return last, nil, fmt.Errorf("error reading gzip resume file: %w", err)
+			return last, err
 		}
 
-		if cursor, err := parseCursor(line); err == nil {
-			last = cursor
+		cursor, err := parseCursor(line)
+		if err != nil {
+			return nil, fmt.Errorf("%w: line is not a log entry: %w", ErrNotAnExport, err)
 		}
+		last = cursor
 		line = line[:0]
 	}
 }
@@ -319,20 +310,20 @@ func (c *countingReader) ReadByte() (byte, error) {
 	return b, err
 }
 
-// parseCursor builds a cursor from a single NDJSON line, rejecting blank and
-// truncated lines and any log missing a block number or log index.
+// parseCursor builds a cursor from a single NDJSON line. Callers wrap the
+// returned error with the sentinel that fits their context.
 func parseCursor(line []byte) (*Cursor, error) {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
-		return nil, ErrNoLogs
+		return nil, errors.New("blank line")
 	}
 
 	var parsed cursorLine
 	if err := json.Unmarshal(line, &parsed); err != nil {
-		return nil, ErrNoLogs
+		return nil, err
 	}
 	if parsed.BlockNumber == nil || parsed.LogIndex == nil {
-		return nil, ErrNoLogs
+		return nil, errors.New("missing blockNumber or logIndex")
 	}
 
 	return &Cursor{

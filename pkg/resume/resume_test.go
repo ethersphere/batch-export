@@ -19,12 +19,6 @@ import (
 	"github.com/ethersphere/batch-export/pkg/resume"
 )
 
-// windowSize mirrors the unexported constant of the same name in resume.go:
-// how much of a plain NDJSON file lastCursorPlain reads at a time when
-// walking backwards from EOF. Tests use it to construct cases that straddle
-// a window boundary.
-const windowSize = 64 * 1024
-
 // Export file names. The format is detected from the file's leading bytes, so
 // the name a case uses never decides how it is read.
 const (
@@ -106,31 +100,6 @@ func TestReadCursor(t *testing.T) {
 	}
 	many := ndjson(t, manyLogs...)
 
-	// garbageLines are newline-delimited but unparseable, as if a different
-	// file had been concatenated onto a good export.
-	garbageLines := bytes.Repeat([]byte("not-json\n"), 12*1024)
-
-	// straddle places a valid log line across the boundary between the last
-	// two windows lastCursorPlain reads: reassembling it requires appending
-	// each re-read window before the carried tail, in file order. Swap that
-	// order and the line comes out garbled — which a case whose target sits
-	// wholly inside one window can never catch.
-	straddleTarget := ndjson(t, testLog(4096, 3))
-	straddlePrefix := bytes.Repeat([]byte("not-json\n"), 4)
-	// afterLen puts the boundary (windowSize bytes from EOF) strictly inside
-	// straddleTarget, rather than at a round offset that could drift.
-	afterLen := windowSize - len(straddleTarget)/2
-	filler := []byte("not-json\n")
-	straddleAfter := bytes.Repeat(filler, afterLen/len(filler)+2)[:afterLen]
-	straddle := append(append(append([]byte{}, straddlePrefix...), straddleTarget...), straddleAfter...)
-
-	straddleLineStart := len(straddlePrefix)
-	straddleLineEnd := len(straddlePrefix) + len(straddleTarget)
-	straddleBoundary := len(straddle) - windowSize
-	if straddleBoundary <= straddleLineStart || straddleBoundary >= straddleLineEnd {
-		t.Fatalf("test setup: boundary %d does not straddle target line [%d, %d)", straddleBoundary, straddleLineStart, straddleLineEnd)
-	}
-
 	// twoLogsEnd is the offset just past the newline closing the second of
 	// threeLogs: the last clean boundary once the third line loses its own.
 	twoLogsEnd := int64(len(ndjson(t, testLog(100, 0), testLog(101, 1))))
@@ -184,34 +153,10 @@ func TestReadCursor(t *testing.T) {
 			wantCleanSize: twoLogsEnd,
 		},
 		{
-			name:          "line missing blockNumber is skipped",
-			content:       append(append([]byte{}, threeLogs...), []byte("{\"address\":\"0x1\",\"topics\":[],\"data\":\"0x\"}\n")...),
-			wantBlock:     102,
-			wantIndex:     7,
-			wantTruncated: true,
-			wantCleanSize: threeLogsEnd,
-		},
-		{
-			name:      "spans multiple backward read windows",
+			name:      "many logs",
 			content:   many,
 			wantBlock: 2999,
 			wantIndex: 15,
-		},
-		{
-			name:          "walks back across windows of garbage lines",
-			content:       append(append([]byte{}, threeLogs...), garbageLines...),
-			wantBlock:     102,
-			wantIndex:     7,
-			wantTruncated: true,
-			wantCleanSize: threeLogsEnd,
-		},
-		{
-			name:          "valid line straddles a window boundary",
-			content:       straddle,
-			wantBlock:     4096,
-			wantIndex:     3,
-			wantTruncated: true,
-			wantCleanSize: int64(straddleLineEnd),
 		},
 		{
 			name:           "gzip",
@@ -258,6 +203,13 @@ func TestReadCursor(t *testing.T) {
 			wantTruncated:  true,
 			wantCleanSize:  int64(len(gz(t, threeLogs))),
 		},
+		{
+			name:           "empty trailing gzip member is valid",
+			content:        append(gz(t, threeLogs), gz(t, nil)...),
+			wantBlock:      102,
+			wantIndex:      7,
+			wantCompressed: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -294,26 +246,105 @@ func TestReadCursor(t *testing.T) {
 	}
 }
 
-func TestReadCursorErrors(t *testing.T) {
+// TestReadRefusals covers §5's strict contract: the only irregularity
+// tolerated is the tool's own interrupted final write. Content the tool never
+// writes is ErrNotAnExport; a file consistent with tool output but holding no
+// complete entry is ErrNoLogs.
+func TestReadRefusals(t *testing.T) {
 	t.Parallel()
+
+	logs := ndjson(t, testLog(100, 0), testLog(101, 0))
 
 	tests := []struct {
 		name    string
 		content []byte
+		wantErr error
 	}{
-		{name: "empty file", content: []byte{}},
-		{name: "only a newline", content: []byte("\n")},
-		{name: "only garbage lines", content: bytes.Repeat([]byte("not-json\n"), 10)},
-		{name: "single unterminated line larger than the cap", content: bytes.Repeat([]byte("x"), 2<<20)},
+		{
+			name:    "empty file",
+			content: []byte{},
+			wantErr: resume.ErrNoLogs,
+		},
+		{
+			name:    "plain file holding one unterminated line",
+			content: bytes.TrimSuffix(ndjson(t, testLog(100, 0)), []byte("\n")),
+			wantErr: resume.ErrNoLogs,
+		},
+		{
+			// The tool never writes a blank line.
+			name:    "only a newline",
+			content: []byte("\n"),
+			wantErr: resume.ErrNotAnExport,
+		},
+		{
+			name:    "trailing blank line after valid logs",
+			content: append(append([]byte{}, logs...), '\n'),
+			wantErr: resume.ErrNotAnExport,
+		},
+		{
+			// A complete line that is not a log entry means the file was
+			// altered after export; refusing beats guessing what to cut.
+			name:    "trailing non-log line after valid logs",
+			content: append(append([]byte{}, logs...), []byte("not-json\n")...),
+			wantErr: resume.ErrNotAnExport,
+		},
+		{
+			name:    "trailing log line missing blockNumber",
+			content: append(append([]byte{}, logs...), []byte("{\"address\":\"0x1\",\"topics\":[],\"data\":\"0x\"}\n")...),
+			wantErr: resume.ErrNotAnExport,
+		},
+		{
+			name:    "only garbage lines",
+			content: bytes.Repeat([]byte("not-json\n"), 10),
+			wantErr: resume.ErrNotAnExport,
+		},
+		{
+			// Finding #4's shape: refused from a single tail read, no
+			// backward scan through the junk.
+			name:    "newline-free tail longer than a line can be",
+			content: append(append([]byte{}, logs...), bytes.Repeat([]byte("x"), 1<<20+1)...),
+			wantErr: resume.ErrNotAnExport,
+		},
+		{
+			name:    "single unterminated line larger than the cap",
+			content: bytes.Repeat([]byte("x"), 2<<20),
+			wantErr: resume.ErrNotAnExport,
+		},
+		{
+			// A cleanly terminated member whose content stops mid-line
+			// cannot come from this tool: members hold whole lines, and an
+			// interrupted write cannot produce a valid trailer.
+			name:    "gzip member ending mid line",
+			content: gz(t, bytes.TrimSuffix(logs, []byte("\n"))),
+			wantErr: resume.ErrNotAnExport,
+		},
+		{
+			// Finding #6's shape: foreign data concatenated as its own valid
+			// member. Refused rather than treated as a removable tail.
+			name:    "gzip junk member after valid member",
+			content: append(gz(t, logs), gz(t, []byte("not-json\nalso-not\n"))...),
+			wantErr: resume.ErrNotAnExport,
+		},
+		{
+			name:    "gzip member holding a non-log line between logs",
+			content: gz(t, append(append([]byte{}, logs...), []byte("not-json\n")...)),
+			wantErr: resume.ErrNotAnExport,
+		},
+		{
+			// A sole member without its trailer is an interrupted first
+			// write: nothing to resume from, so a fresh export is the remedy.
+			name:    "gzip with a single truncated member",
+			content: truncateLast(gz(t, logs), 6),
+			wantErr: resume.ErrNoLogs,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := resume.Read(write(t, plainFile, tt.content))
-			if !errors.Is(err, resume.ErrNoLogs) {
-				t.Fatalf("Read() error = %v, want ErrNoLogs", err)
+			if _, err := resume.Read(write(t, plainFile, tt.content)); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Read() error = %v, want %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -701,54 +732,6 @@ func TestResumeAfterInterruptedWrite(t *testing.T) {
 			}
 			if cursor2.Truncated {
 				t.Errorf("Truncated = true, want false: the recovered file is not clean")
-			}
-		})
-	}
-}
-
-// TestReadRefusesWithoutACleanBoundary covers files whose content cannot be
-// appended to at any offset the reader can positively identify. Refusing is
-// the safety property that has to hold even where recovery cannot: guessing a
-// boundary would corrupt what is already there.
-func TestReadRefusesWithoutACleanBoundary(t *testing.T) {
-	t.Parallel()
-
-	logs := ndjson(t, testLog(100, 0), testLog(101, 0))
-
-	tests := []struct {
-		name    string
-		content []byte
-		wantErr error
-	}{
-		{
-			// A single member whose trailer never made it to disk. Its logs
-			// decode, but there is no member boundary to concatenate at and
-			// the file cannot be rewritten in place, so the run must stop.
-			name:    "gzip with a single truncated member",
-			content: truncateLast(gz(t, logs), 6),
-			wantErr: resume.ErrNoCleanBoundary,
-		},
-		{
-			// The member is intact but its data stops mid-line, so a second
-			// member would glue its first log onto the unterminated one.
-			name:    "gzip member ending mid line",
-			content: gz(t, bytes.TrimSuffix(logs, []byte("\n"))),
-			wantErr: resume.ErrNoCleanBoundary,
-		},
-		{
-			// The only line has no newline, so no entry is complete.
-			name:    "plain file holding one unterminated line",
-			content: bytes.TrimSuffix(ndjson(t, testLog(100, 0)), []byte("\n")),
-			wantErr: resume.ErrNoLogs,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			if _, err := resume.Read(write(t, plainFile, tt.content)); !errors.Is(err, tt.wantErr) {
-				t.Fatalf("Read() error = %v, want %v", err, tt.wantErr)
 			}
 		})
 	}
