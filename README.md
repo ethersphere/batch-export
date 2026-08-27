@@ -9,7 +9,7 @@ batch-export is a tool to retrieve Ethereum event logs for specific contracts, p
 - Supports rate limiting for RPC requests.
 - Saves retrieved logs to a specified output file (default: `export.ndjson`) in NDJSON format.
 - Graceful shutdown on interrupt signals (Ctrl+C).
-- Resume an interrupted export from an existing `.ndjson`, `.gz`, or `.gzip` file.
+- Continue a previous export from where it stopped (incremental snapshots).
 
 ## Requirements
 
@@ -50,62 +50,51 @@ The primary command is export.
   -h, --help                       help for export
   -m, --max-request int            Max RPC requests/sec (default 15)
   -o, --output string              Output file path (NDJSON) (default "export.ndjson")
-  -r, --resume string              Resume a previous export file (.ndjson, .gz or .gzip); overrides --start and --output
+  -r, --resume string              Continue a previous export file (.ndjson, .gz or .gzip); combine with --output to write a new snapshot instead of appending in place
       --start uint                 Start block (optional, uses contract start block if 0) (default 31306381)
   -v, --verbosity string           Log verbosity (silent, error, warn, info, debug) (default "info")
 ```
 
-### Resuming an interrupted export
+### Continuing a previous snapshot
 
-Point `--resume` at a file a previous run produced. The tool reads its last
-complete entry, restarts from that block, and appends to the same file:
-
-```sh
-./dist/batch-export export --resume dist/export.ndjson
-```
-
-Compressed exports work the same way and are detected by content, not by
-extension, so `.gz` and `.gzip` both work:
+Instead of re-exporting every block, point `--resume` at the previous
+snapshot and name the new one with `--output`. The previous file is read,
+never modified; the new file holds everything the previous one did plus the
+blocks exported since:
 
 ```sh
-./dist/batch-export export --resume dist/export.ndjson.gzip
+./dist/batch-export export --resume snapshots/2026-07.gzip --output snapshots/2026-08.gzip
 ```
 
-The resumed block is re-queried, because an interrupted run may have saved only
-part of it, and the entries already in the file are skipped. So long as the
-file ends cleanly, resuming neither duplicates nor drops a log. Appending to a
-compressed export adds a second gzip member — standard tools such as `gzcat`,
-`gunzip`, and Go's `compress/gzip` read the result as one continuous stream.
+Formats are detected by content, not extension: `.ndjson`, `.gz` and `.gzip`
+all work, and the output's format always matches the input's. Omitting
+`--output` (or naming the input) appends to the previous file in place — the
+space-saving variant:
 
-#### When the previous run was killed mid-write
-
-A run stopped by `SIGKILL`, a crash, or a full disk can leave a partial entry
-at the end of the file: half a line, a line that never got its newline, or a
-gzip member that never got its trailer. Appending onto any of those would
-corrupt the file, so only an entry that is complete and properly terminated
-counts as the resume point.
-
-The tool finds the last offset at which the file is known to be complete — the
-end of the last newline-terminated line that parses as a log entry, or of the
-last whole gzip member — and discards whatever follows it, logging how many
-bytes it dropped and from where:
-
-```log
-"level"="warning" "msg"="resume file ends with a partial write, discarding it" "offset"=89649991 "discardedBytes"=317
+```sh
+./dist/batch-export export --resume export.ndjson.gzip
 ```
 
-For export content, nothing is lost by that: everything discarded sits at or
-after the resume point, so the resumed query fetches it again. Anything
-discarded that was never a log entry is simply removed and not re-fetched.
-Because a line that parses but has no newline does not count, the resume point
-in that case is the line before it, and that entry is re-fetched too.
+The last exported block is re-queried and entries already present are
+skipped, so continuing neither duplicates nor drops a log. Each continuation
+of a compressed snapshot adds a gzip member — standard tools (`gzcat`,
+`gunzip`, Go, Python) read multi-member files as one stream, a year of
+monthly continuations costs about 0.02% in size, and
+`gzcat old.gzip | gzip > fresh.gzip` consolidates the members any time.
 
-If no such offset can be identified — a gzip file whose only member is
-truncated, for instance, since there is no member boundary to append at — the
-tool refuses to touch the file and exits with an error rather than guess. Fall
-back to a fresh export in that case.
+Keep one canonical snapshot file. `--compress` is ignored when resuming:
+regenerating a `.gzip` from a plain twin is how an independently continued
+archive gets overwritten. Resume a compressed file to get a compressed
+result.
 
-When `--resume` is set it overrides `--start` and `--output`.
+Resume only files this tool produced. The file's tail is validated before
+anything is written: content the tool never writes — a non-log line, foreign
+data, an alien gzip member — is refused rather than repaired. The one
+exception is the tool's own interrupted final write (a run killed
+mid-export): in copy mode it is simply not copied, in place it is truncated
+away with a warning, and its entries are re-fetched. Note that resuming does
+not detect a file from a different chain; pairing the snapshot with the
+right `--endpoint` is the operator's contract.
 
 The produced NDJSON is consumed by [batch-archive](https://github.com/ethersphere/batch-archive), which embeds it for use inside Bee.
 
