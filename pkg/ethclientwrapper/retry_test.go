@@ -191,6 +191,9 @@ func TestRetryCallStopsWhenContextIsCanceledDuringBackoff(t *testing.T) {
 	if !errors.Is(err, errTLSHandshakeTimeout) {
 		t.Fatalf("got error %v, want the last call error %v", err, errTLSHandshakeTimeout)
 	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("got error %v, want it to report the cancellation too", err)
+	}
 	if calls != 1 {
 		t.Errorf("made %d calls, want 1", calls)
 	}
@@ -211,6 +214,9 @@ func TestRetryCallStopsWhenContextIsAlreadyCanceled(t *testing.T) {
 	})
 	if !errors.Is(err, errTLSHandshakeTimeout) {
 		t.Fatalf("got error %v, want %v", err, errTLSHandshakeTimeout)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("got error %v, want it to report the cancellation too", err)
 	}
 	if calls != 1 {
 		t.Errorf("made %d calls, want 1", calls)
@@ -264,6 +270,7 @@ func TestIsRetryable(t *testing.T) {
 		{name: "connection reset", err: syscall.ECONNRESET, want: true},
 		{name: "connection refused", err: syscall.ECONNREFUSED, want: true},
 		{name: "broken pipe", err: syscall.EPIPE, want: true},
+		{name: "http 408", err: rpc.HTTPError{StatusCode: 408, Status: "408 Request Timeout"}, want: true},
 		{name: "http 429", err: rpc.HTTPError{StatusCode: 429, Status: "429 Too Many Requests"}, want: true},
 		{name: "http 502", err: rpc.HTTPError{StatusCode: 502, Status: "502 Bad Gateway"}, want: true},
 		{name: "http 400", err: rpc.HTTPError{StatusCode: 400, Status: "400 Bad Request"}, want: false},

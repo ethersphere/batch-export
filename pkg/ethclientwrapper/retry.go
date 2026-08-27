@@ -74,7 +74,8 @@ func (c retryConfig) withDefaults() retryConfig {
 
 // retryCall calls fn, retrying transient failures with an exponential backoff.
 // It gives up as soon as the error is not transient, the retries are exhausted
-// or ctx is done, and then returns the error of the last attempt.
+// or ctx is done, and then returns the error of the last attempt, joined with
+// the context error when ctx is what stopped it.
 func retryCall[T any](ctx context.Context, cfg retryConfig, fn func() (T, error)) (T, error) {
 	cfg = cfg.withDefaults()
 
@@ -85,14 +86,14 @@ func retryCall[T any](ctx context.Context, cfg retryConfig, fn func() (T, error)
 		}
 
 		if attempt >= cfg.maxRetries || !isRetryable(err) || ctx.Err() != nil {
-			return result, err
+			return result, errors.Join(err, ctx.Err())
 		}
 
 		delay := cfg.jitter(backoffDelay(attempt+1, cfg.baseDelay, cfg.maxDelay))
 		cfg.onRetry(attempt+1, delay, err)
 
 		if sleepErr := cfg.sleep(ctx, delay); sleepErr != nil {
-			return result, err
+			return result, errors.Join(err, sleepErr)
 		}
 	}
 }
@@ -151,7 +152,7 @@ func isRetryable(err error) bool {
 	// The endpoint answered with an HTTP error: retry only if it is temporary.
 	var httpErr rpc.HTTPError
 	if errors.As(err, &httpErr) {
-		return httpErr.StatusCode == 429 || httpErr.StatusCode >= 500
+		return httpErr.StatusCode == 408 || httpErr.StatusCode == 429 || httpErr.StatusCode >= 500
 	}
 
 	// The endpoint answered with a JSON-RPC error, so the request reached it and
