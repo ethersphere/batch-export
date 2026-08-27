@@ -45,6 +45,19 @@ func blocksIn(t *testing.T, path string) []uint64 {
 	return blocks
 }
 
+// seed writes logs for the given blocks to a fresh file at path.
+func seed(t *testing.T, path string, blocks ...uint64) {
+	t.Helper()
+
+	w, err := filestore.CreateWriter(path)
+	if err != nil {
+		t.Fatalf("CreateWriter() error = %v", err)
+	}
+	if err := filestore.AppendLogsAsync(t.Context(), feed(blocks...), w, nil); err != nil {
+		t.Fatalf("AppendLogsAsync() error = %v", err)
+	}
+}
+
 // feed returns a closed channel already holding logs for the given blocks.
 // Topics must stay a non-nil empty slice: go-ethereum's generated
 // Log.UnmarshalJSON rejects a null "topics" as a missing required field.
@@ -58,7 +71,7 @@ func feed(blocks ...uint64) <-chan types.Log {
 	return ch
 }
 
-func TestSaveLogsAsyncReplacesExistingFile(t *testing.T) {
+func TestCreateWriterReplacesExistingFile(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "export.ndjson")
@@ -66,9 +79,7 @@ func TestSaveLogsAsyncReplacesExistingFile(t *testing.T) {
 		t.Fatalf("seed %s: %v", path, err)
 	}
 
-	if err := filestore.SaveLogsAsync(t.Context(), feed(1, 2), path); err != nil {
-		t.Fatalf("SaveLogsAsync() error = %v", err)
-	}
+	seed(t, path, 1, 2)
 
 	want := []uint64{1, 2}
 	if got := blocksIn(t, path); !slices.Equal(got, want) {
@@ -80,9 +91,7 @@ func TestAppendLogsAsyncKeepsExistingContent(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "export.ndjson")
-	if err := filestore.SaveLogsAsync(t.Context(), feed(1, 2), path); err != nil {
-		t.Fatalf("SaveLogsAsync() error = %v", err)
-	}
+	seed(t, path, 1, 2)
 
 	w, err := filestore.AppendWriter(path)
 	if err != nil {
@@ -102,9 +111,7 @@ func TestAppendLogsAsyncSkipsFilteredLogs(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "export.ndjson")
-	if err := filestore.SaveLogsAsync(t.Context(), feed(1, 2), path); err != nil {
-		t.Fatalf("SaveLogsAsync() error = %v", err)
-	}
+	seed(t, path, 1, 2)
 
 	w, err := filestore.AppendWriter(path)
 	if err != nil {
@@ -125,9 +132,7 @@ func TestAppendLogsAsyncClosesWriterOnCancel(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "export.ndjson")
-	if err := filestore.SaveLogsAsync(t.Context(), feed(1), path); err != nil {
-		t.Fatalf("SaveLogsAsync() error = %v", err)
-	}
+	seed(t, path, 1)
 
 	w, err := filestore.AppendWriter(path)
 	if err != nil {

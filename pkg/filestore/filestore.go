@@ -23,17 +23,6 @@ func CreateWriter(filePath string) (io.WriteCloser, error) {
 	return file, nil
 }
 
-// SaveLogsAsync writes logs to a file asynchronously, replacing any file
-// already at filePath. The file is closed before returning.
-func SaveLogsAsync(ctx context.Context, logChan <-chan types.Log, filePath string) error {
-	w, err := CreateWriter(filePath)
-	if err != nil {
-		return err
-	}
-
-	return AppendLogsAsync(ctx, logChan, w, nil)
-}
-
 // AppendWriter opens an existing NDJSON file for appending.
 func AppendWriter(filePath string) (io.WriteCloser, error) {
 	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_APPEND, 0o644)
