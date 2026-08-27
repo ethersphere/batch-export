@@ -140,7 +140,7 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 				defer wg.Done()
 
 				if err := saveLogs(ctx, logChan, w, cursor); err != nil {
-					if errors.Is(err, context.Canceled) {
+					if solelyCanceled(err) {
 						c.log.Error(err, "context canceled while saving logs")
 						return
 					}
@@ -243,4 +243,27 @@ func saveLogs(ctx context.Context, logChan <-chan types.Log, w io.WriteCloser, c
 	}
 
 	return filestore.AppendLogsAsync(ctx, logChan, w, skip)
+}
+
+// solelyCanceled reports whether err contains nothing beyond context
+// cancellation, unwrapping joined and wrapped errors along the way. It is
+// stricter than errors.Is(err, context.Canceled): AppendLogsAsync joins the
+// save error with the destination's Close error, and a SIGINT racing a
+// failing gzip-member flush must not be reported as pure cancellation.
+func solelyCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	if u, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, e := range u.Unwrap() {
+			if !solelyCanceled(e) {
+				return false
+			}
+		}
+		return true
+	}
+	if u := errors.Unwrap(err); u != nil {
+		return solelyCanceled(u)
+	}
+	return errors.Is(err, context.Canceled)
 }
