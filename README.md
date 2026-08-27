@@ -46,7 +46,7 @@ The primary command is export.
   -b, --block-range-limit uint32   Max blocks per log query (default 5)
   -c, --compress                   Compress to GZIP
       --end uint                   End block (optional, uses latest block if 0)
-  -e, --endpoint string            Ethereum RPC endpoint URL
+  -e, --endpoint string            Ethereum based RPC endpoint URL (default "https://rpc.gnosis.gateway.fm")
   -h, --help                       help for export
   -m, --max-request int            Max RPC requests/sec (default 15)
   -o, --output string              Output file path (NDJSON) (default "export.ndjson")
@@ -63,14 +63,20 @@ never modified; the new file holds everything the previous one did plus the
 blocks exported since:
 
 ```sh
-./dist/batch-export export --resume snapshots/2026-07.gzip --output snapshots/2026-08.gzip
+./dist/batch-export export --resume snapshots/2026-07.ndjson.gzip --output snapshots/2026-08.ndjson.gzip
 ```
 
-If `--output` already names an existing file, it is overwritten — the same
-`os.Create` semantics as a fresh export, so pick a new name for each snapshot.
+If `--output` names a different existing file, it is overwritten — the same
+`os.Create` semantics as a fresh export — so pick a new name for each
+snapshot. (Naming the input itself under another spelling — absolute vs
+relative, a symlink, a case difference — is detected and appends in place
+instead.)
 
 Formats are detected by content, not extension: `.ndjson`, `.gz` and `.gzip`
-all work, and the output's format always matches the input's. Omitting
+all work, and the output's format always matches the input's. Gzip stores no
+filename inside, so decompressing names the result after the archive minus
+its extension — name snapshots with the double extension, as above, and
+extraction yields a `.ndjson` file. Omitting
 `--output` (or naming the input) appends to the previous file in place — the
 space-saving variant:
 
