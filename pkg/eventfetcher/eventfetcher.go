@@ -64,14 +64,17 @@ func (c *Client) GetLogs(ctx context.Context, tr *Request) (<-chan types.Log, <-
 
 		var fromBlock, toBlock *big.Int
 
-		// Determine toBlock
+		// Determine toBlock. The default end is the latest finalized block,
+		// not the chain head: blocks near the head can still be reorged, and
+		// a snapshot holding logs from an orphaned block cannot be repaired
+		// by a later resumed export.
 		if tr.EndBlock == 0 {
-			latestBlock, err := c.client.BlockNumber(ctx)
+			finalizedBlock, err := c.client.FinalizedBlockNumber(ctx)
 			if err != nil {
-				errorChan <- fmt.Errorf("failed to get latest block number: %w", err)
+				errorChan <- fmt.Errorf("failed to get finalized block number: %w", err)
 				return
 			}
-			toBlock = new(big.Int).SetUint64(latestBlock)
+			toBlock = new(big.Int).SetUint64(finalizedBlock)
 		} else {
 			toBlock = big.NewInt(int64(tr.EndBlock))
 		}
