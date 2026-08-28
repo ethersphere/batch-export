@@ -154,7 +154,7 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 	cmd.Flags().Uint32VarP(&blockRangeLimit, "block-range-limit", "b", 5, "Max blocks per log query")
 	cmd.Flags().StringVarP(&outputFile, "output", "o", "export.ndjson", "Output file path (NDJSON)")
 	cmd.Flags().BoolVarP(&compress, "compress", "c", false, "Compress to GZIP")
-	cmd.Flags().BoolVar(&slim, "slim", false, "Emit only the types.Log fields Bee consumes (address, topics, data, blockNumber, transactionHash); otherwise the full geth types.Log JSON shape is emitted")
+	cmd.Flags().BoolVar(&slim, "slim", true, "Emit only the types.Log fields Bee consumes (address, topics, data, blockNumber, transactionHash); pass --slim=false for the full geth types.Log JSON shape")
 	cmd.Flags().IntVarP(&retryMax, "retry-max", "", 5, "Max retries per RPC request on transient network errors (0 disables retrying)")
 	cmd.Flags().DurationVarP(&retryDelay, "retry-delay", "", ethclient.DefaultRetryDelay, "Delay before the first retry, doubling per retry up to 30s")
 

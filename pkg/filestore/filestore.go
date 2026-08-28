@@ -44,6 +44,11 @@ func SaveLogsAsync(ctx context.Context, logChan <-chan types.Log, filePath strin
 
 	encoder := json.NewEncoder(file)
 
+	encode := func(l types.Log) error { return encoder.Encode(l) }
+	if slim {
+		encode = func(l types.Log) error { return encoder.Encode(NewSlimLog(l)) }
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -53,12 +58,7 @@ func SaveLogsAsync(ctx context.Context, logChan <-chan types.Log, filePath strin
 				return nil
 			}
 
-			var v any = logObj
-			if slim {
-				v = NewSlimLog(logObj)
-			}
-
-			if err := encoder.Encode(v); err != nil {
+			if err := encode(logObj); err != nil {
 				return fmt.Errorf("error encoding log: %w", err)
 			}
 		}

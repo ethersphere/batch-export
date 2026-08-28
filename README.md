@@ -51,7 +51,7 @@ The primary command is export.
   -h, --help                       help for export
   -m, --max-request int            Max RPC requests/sec (default 15)
   -o, --output string              Output file path (NDJSON) (default "export.ndjson")
-      --slim                       Emit only the types.Log fields Bee consumes (default false)
+      --slim                       Emit only the types.Log fields Bee consumes (default true)
       --retry-delay duration       Delay before the first retry, doubling per retry up to 30s (default 1s)
       --retry-max int              Max retries per RPC request on transient network errors (0 disables retrying) (default 5)
       --start uint                 Start block (optional, uses contract start block if 0) (default 31306381)
