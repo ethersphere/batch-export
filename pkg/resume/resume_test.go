@@ -1256,4 +1256,3 @@ func TestPrepareOutputInvalidDirectory(t *testing.T) {
 		t.Fatal("input was modified on failed PrepareOutput")
 	}
 }
-
