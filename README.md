@@ -7,6 +7,7 @@ batch-export is a tool to retrieve Ethereum event logs for specific contracts, p
 - Retrieve event logs for a specified contract address and block range.
 - Handles large block ranges by querying in smaller chunks.
 - Supports rate limiting for RPC requests.
+- Retries requests that fail with a transient network error (timeouts, dropped connections, rate limiting) using an exponential backoff.
 - Saves retrieved logs to a specified output file (default: `export.ndjson`) in NDJSON format.
 - Graceful shutdown on interrupt signals (Ctrl+C).
 
@@ -49,6 +50,8 @@ The primary command is export.
   -h, --help                       help for export
   -m, --max-request int            Max RPC requests/sec (default 15)
   -o, --output string              Output file path (NDJSON) (default "export.ndjson")
+      --retry-delay duration       Delay before the first retry, doubling per retry up to 30s (default 1s)
+      --retry-max int              Max retries per RPC request on transient network errors (0 disables retrying) (default 5)
       --start uint                 Start block (optional, uses contract start block if 0) (default 31306381)
   -v, --verbosity string           Log verbosity (silent, error, warn, info, debug) (default "info")
 ```
