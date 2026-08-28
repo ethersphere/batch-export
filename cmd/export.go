@@ -30,6 +30,8 @@ func (c *command) initExportCmd() (err error) {
 		outputFile      string
 		compress        bool
 		resumeFile      string
+		retryMax        int
+		retryDelay      time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -37,7 +39,8 @@ func (c *command) initExportCmd() (err error) {
 		Short: "Export Swarm Postage Stamp contract event logs within a block range.",
 		Long: `Exports event logs for the Swarm Postage Stamp contract from a specified Ethereum RPC endpoint
 within a given block range (--start to --end). It handles large ranges by querying in chunks (--block-range-limit)
-and respects RPC rate limits (--max-request).
+and respects RPC rate limits (--max-request). Requests failing with a transient network error are retried
+with an exponential backoff (--retry-max, --retry-delay).
 
 The retrieved logs are saved to the specified output file (default: 'export.ndjson') in NDJSON format.
 The process can be interrupted at any time (Ctrl+C), and it will attempt to save already retrieved logs before exiting.`,
@@ -75,7 +78,18 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 				)
 			}
 
-			ec, err := ethclient.NewClient(ctx, rpcEndpoint, ethclient.WithRateLimit(maxRequest), ethclient.WithLogger(c.log))
+			if retryMax < 0 {
+				return fmt.Errorf("invalid --retry-max %d: must not be negative", retryMax)
+			}
+			if retryDelay <= 0 {
+				return fmt.Errorf("invalid --retry-delay %s: must be greater than zero", retryDelay)
+			}
+
+			ec, err := ethclient.NewClient(ctx, rpcEndpoint,
+				ethclient.WithRateLimit(maxRequest),
+				ethclient.WithLogger(c.log),
+				ethclient.WithRetry(retryMax, retryDelay),
+			)
 			if err != nil {
 				return fmt.Errorf("failed to connect to the Ethereum client: %w", err)
 			}
@@ -215,6 +229,8 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 	cmd.Flags().StringVarP(&outputFile, "output", "o", "export.ndjson", "Output file path (NDJSON)")
 	cmd.Flags().BoolVarP(&compress, "compress", "c", false, "Compress to GZIP")
 	cmd.Flags().StringVarP(&resumeFile, "resume", "r", "", "Continue a previous export file (.ndjson, .gz or .gzip); combine with --output to write a new snapshot instead of appending in place")
+	cmd.Flags().IntVarP(&retryMax, "retry-max", "", 5, "Max retries per RPC request on transient network errors (0 disables retrying)")
+	cmd.Flags().DurationVarP(&retryDelay, "retry-delay", "", ethclient.DefaultRetryDelay, "Delay before the first retry, doubling per retry up to 30s")
 
 	c.root.AddCommand(cmd)
 

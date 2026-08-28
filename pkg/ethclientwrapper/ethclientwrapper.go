@@ -2,7 +2,9 @@ package ethclientwrapper
 
 import (
 	"context"
+	"math/big"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -15,6 +17,7 @@ type Client struct {
 	*ethclient.Client
 	limiter *rate.Limiter
 	logger  log.Logger
+	retry   retryConfig
 	rawURL  string
 	mu      sync.Mutex
 }
@@ -32,6 +35,16 @@ func WithRateLimit(requestsPerSecond int) ClientOption {
 func WithLogger(logger log.Logger) ClientOption {
 	return func(c *Client) {
 		c.logger = logger
+	}
+}
+
+// WithRetry retries requests that fail with a transient error, such as a
+// timed out TLS handshake. maxRetries is the number of retries attempted after
+// the initial request, 0 disables retrying. baseDelay is the delay before the
+// first retry, doubling for every further retry.
+func WithRetry(maxRetries int, baseDelay time.Duration) ClientOption {
+	return func(c *Client) {
+		c.retry = newRetryConfig(maxRetries, baseDelay)
 	}
 }
 
@@ -62,14 +75,52 @@ func (c *Client) Close() {
 }
 
 func (c *Client) FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]types.Log, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	return retryCall(ctx, c.retryConfigFor("FilterLogs"), func() ([]types.Log, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	if err := c.applyRateLimit(ctx); err != nil {
-		return nil, err
+		if err := c.applyRateLimit(ctx); err != nil {
+			return nil, err
+		}
+
+		return c.Client.FilterLogs(ctx, q)
+	})
+}
+
+func (c *Client) BlockNumber(ctx context.Context) (uint64, error) {
+	return retryCall(ctx, c.retryConfigFor("BlockNumber"), func() (uint64, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		if err := c.applyRateLimit(ctx); err != nil {
+			return 0, err
+		}
+
+		return c.Client.BlockNumber(ctx)
+	})
+}
+
+func (c *Client) ChainID(ctx context.Context) (*big.Int, error) {
+	return retryCall(ctx, c.retryConfigFor("ChainID"), func() (*big.Int, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		if err := c.applyRateLimit(ctx); err != nil {
+			return nil, err
+		}
+
+		return c.Client.ChainID(ctx)
+	})
+}
+
+// retryConfigFor returns the retry config for the named call, reporting every
+// retry through the client logger.
+func (c *Client) retryConfigFor(call string) retryConfig {
+	cfg := c.retry
+	cfg.onRetry = func(attempt int, delay time.Duration, err error) {
+		c.logger.Warning("retrying rpc call", "call", call, "attempt", attempt, "retry_in", delay, "error", err)
 	}
-
-	return c.Client.FilterLogs(ctx, q)
+	return cfg
 }
 
 // applyRateLimit checks if the limiter is set and applies the rate limit.
