@@ -1096,3 +1096,164 @@ func TestGzipCleanSizeIsAMemberBoundary(t *testing.T) {
 		t.Fatalf("content = %s, want %s", got, want)
 	}
 }
+
+// TestResumeMultipleEmptyAppends checks that resuming multiple times when no
+// new logs exist on chain (e.g. producing empty writes or empty gzip members)
+// preserves existing data and allows subsequent appends with new logs.
+func TestResumeMultipleEmptyAppends(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		fileName   string
+		compressed bool
+	}{
+		{name: nameFormatPlain, fileName: plainFile, compressed: false},
+		{name: nameFormatGzip, fileName: gzipFile, compressed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), tc.fileName)
+
+			// Initial write of 2 logs
+			initLogs := []types.Log{testLog(100, 0), testLog(101, 0)}
+			var initialContent []byte
+			if tc.compressed {
+				initialContent = gz(t, ndjson(t, initLogs...))
+			} else {
+				initialContent = ndjson(t, initLogs...)
+			}
+			if err := os.WriteFile(path, initialContent, 0o644); err != nil {
+				t.Fatalf("write initial file: %v", err)
+			}
+
+			// First empty resume: 0 new logs
+			cursor, err := resume.Read(path)
+			if err != nil {
+				t.Fatalf("first Read() error = %v", err)
+			}
+			if _, err := resume.PrepareOutput(cursor, path, path); err != nil {
+				t.Fatalf("first PrepareOutput() error = %v", err)
+			}
+			if err := filestore.AppendLogsAsync(t.Context(), feed(), appendWriter(t, path, cursor), cursor.Skip); err != nil {
+				t.Fatalf("first AppendLogsAsync() error = %v", err)
+			}
+
+			// Second empty resume: 0 new logs
+			cursor, err = resume.Read(path)
+			if err != nil {
+				t.Fatalf("second Read() error = %v", err)
+			}
+			if _, err := resume.PrepareOutput(cursor, path, path); err != nil {
+				t.Fatalf("second PrepareOutput() error = %v", err)
+			}
+			if err := filestore.AppendLogsAsync(t.Context(), feed(), appendWriter(t, path, cursor), cursor.Skip); err != nil {
+				t.Fatalf("second AppendLogsAsync() error = %v", err)
+			}
+
+			// Third resume: 2 new logs
+			newLogs := []types.Log{testLog(101, 0), testLog(102, 0), testLog(103, 0)}
+			cursor, err = resume.Read(path)
+			if err != nil {
+				t.Fatalf("third Read() error = %v", err)
+			}
+			if _, err := resume.PrepareOutput(cursor, path, path); err != nil {
+				t.Fatalf("third PrepareOutput() error = %v", err)
+			}
+			if err := filestore.AppendLogsAsync(t.Context(), feed(newLogs...), appendWriter(t, path, cursor), cursor.Skip); err != nil {
+				t.Fatalf("third AppendLogsAsync() error = %v", err)
+			}
+
+			// Verify all 4 logs are present and correctly ordered
+			want := []types.Log{testLog(100, 0), testLog(101, 0), testLog(102, 0), testLog(103, 0)}
+			got := logsIn(t, path)
+			if !slices.Equal(ids(got), ids(want)) {
+				t.Fatalf("logs = %v, want %v", ids(got), ids(want))
+			}
+		})
+	}
+}
+
+// TestCursorSkipWithIndexGaps tests that Cursor.Skip correctly skips
+// non-consecutive log indices within the same block and preceding blocks.
+func TestCursorSkipWithIndexGaps(t *testing.T) {
+	t.Parallel()
+
+	cursor := &resume.Cursor{
+		BlockNumber: 500,
+		LogIndex:    7,
+	}
+
+	tests := []struct {
+		name string
+		log  types.Log
+		want bool
+	}{
+		{name: "earlier block", log: testLog(499, 100), want: true},
+		{name: "same block lower index", log: testLog(500, 3), want: true},
+		{name: "same block exact index", log: testLog(500, 7), want: true},
+		{name: "same block higher index", log: testLog(500, 8), want: false},
+		{name: "same block much higher index", log: testLog(500, 20), want: false},
+		{name: "later block index 0", log: testLog(501, 0), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := cursor.Skip(tt.log); got != tt.want {
+				t.Errorf("Skip(%+v) = %v, want %v", tt.log, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCRLFLineEndings ensures NDJSON files with CRLF (\r\n) line endings
+// are parsed and resumed without errors.
+func TestCRLFLineEndings(t *testing.T) {
+	t.Parallel()
+
+	raw := ndjson(t, testLog(100, 0), testLog(101, 5))
+	crlf := bytes.ReplaceAll(raw, []byte("\n"), []byte("\r\n"))
+
+	path := write(t, plainFile, crlf)
+	cursor, err := resume.Read(path)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if cursor.BlockNumber != 101 || cursor.LogIndex != 5 {
+		t.Errorf("cursor = {%d,%d}, want {101,5}", cursor.BlockNumber, cursor.LogIndex)
+	}
+	if cursor.CleanSize != int64(len(crlf)) {
+		t.Errorf("CleanSize = %d, want %d", cursor.CleanSize, len(crlf))
+	}
+}
+
+// TestPrepareOutputInvalidDirectory asserts that copying to a non-existent
+// target directory reports an error and leaves the input file untouched.
+func TestPrepareOutputInvalidDirectory(t *testing.T) {
+	t.Parallel()
+
+	content := ndjson(t, testLog(100, 0))
+	input := write(t, plainFile, content)
+
+	cursor, err := resume.Read(input)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	output := filepath.Join(t.TempDir(), "nonexistent", "nested", "out.ndjson")
+	if _, err := resume.PrepareOutput(cursor, input, output); err == nil {
+		t.Fatal("PrepareOutput() succeeded for non-existent dir, want error")
+	}
+
+	// Assert input remains intact
+	got, err := os.ReadFile(input)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatal("input was modified on failed PrepareOutput")
+	}
+}
+
