@@ -9,6 +9,7 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethersphere/bee/v2/pkg/log"
 	"golang.org/x/time/rate"
 )
@@ -97,6 +98,24 @@ func (c *Client) BlockNumber(ctx context.Context) (uint64, error) {
 		}
 
 		return c.Client.BlockNumber(ctx)
+	})
+}
+
+// FinalizedBlockNumber returns the number of the latest finalized block.
+func (c *Client) FinalizedBlockNumber(ctx context.Context) (uint64, error) {
+	return retryCall(ctx, c.retryConfigFor("FinalizedBlockNumber"), func() (uint64, error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		if err := c.applyRateLimit(ctx); err != nil {
+			return 0, err
+		}
+
+		header, err := c.HeaderByNumber(ctx, big.NewInt(rpc.FinalizedBlockNumber.Int64()))
+		if err != nil {
+			return 0, err
+		}
+		return header.Number.Uint64(), nil
 	})
 }
 
