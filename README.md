@@ -10,7 +10,7 @@ batch-export is a tool to retrieve Ethereum event logs for specific contracts, p
 - Retries requests that fail with a transient network error (timeouts, dropped connections, rate limiting) using an exponential backoff.
 - Saves retrieved logs to a specified output file (default: `export.ndjson`) in NDJSON format.
 - Graceful shutdown on interrupt signals (Ctrl+C).
-- By default emits a slim log shape — only the `types.Log` fields Bee consumes (`address`, `topics`, `data`, `blockNumber`, `transactionHash`). Pass `--slim=false` to emit the full geth `types.Log` JSON shape for other consumers. The slim shape is decoder-compatible with geth's `types.Log` (so Bee reads both interchangeably).
+- By default emits a slim log shape — only the `types.Log` fields Bee consumes (`address`, `topics`, `data`, `blockNumber`, `transactionHash`), plus `logIndex` so exports stay resumable. Pass `--slim=false` to emit the full geth `types.Log` JSON shape for other consumers. The slim shape is decoder-compatible with geth's `types.Log` (so Bee reads both interchangeably).
 
 ## Requirements
 

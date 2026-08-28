@@ -53,7 +53,7 @@ func TestSlimMatchesFullForKeptKeys(t *testing.T) {
 		t.Fatalf("unmarshal slim: %v", err)
 	}
 
-	kept := []string{"address", "topics", "data", "blockNumber", "transactionHash"}
+	kept := []string{"address", "topics", "data", "blockNumber", "transactionHash", "logIndex"}
 	keptSet := map[string]struct{}{}
 	for _, k := range kept {
 		keptSet[k] = struct{}{}
@@ -71,7 +71,7 @@ func TestSlimMatchesFullForKeptKeys(t *testing.T) {
 
 // TestSlimRoundTripsThroughGethDecoder enforces the Bee-side contract: a slim
 // record must decode into types.Log via geth's UnmarshalJSON with no missing
-// required fields and the five kept fields preserved.
+// required fields and all kept fields preserved.
 func TestSlimRoundTripsThroughGethDecoder(t *testing.T) {
 	in := sampleLog()
 
@@ -104,5 +104,8 @@ func TestSlimRoundTripsThroughGethDecoder(t *testing.T) {
 	}
 	if out.TxHash != in.TxHash {
 		t.Errorf("txHash: got %s want %s", out.TxHash.Hex(), in.TxHash.Hex())
+	}
+	if out.Index != in.Index {
+		t.Errorf("logIndex: got %d want %d", out.Index, in.Index)
 	}
 }
