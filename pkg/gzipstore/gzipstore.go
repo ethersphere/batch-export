@@ -22,11 +22,22 @@ func CompressFile(inputFilePath string, outputFilePath string) error {
 	}
 	defer outputFile.Close()
 
-	gzipWriter := gzip.NewWriter(outputFile)
-	defer gzipWriter.Close()
+	return compress(outputFile, inputFile)
+}
 
-	if _, err := io.Copy(gzipWriter, inputFile); err != nil {
-		return fmt.Errorf("failed to write compressed data to '%s': %w", outputFilePath, err)
+func compress(dst io.Writer, src io.Reader) (err error) {
+	gzipWriter := gzip.NewWriter(dst)
+	// Close flushes the remaining compressed bytes and the gzip footer; a
+	// swallowed error here would report a truncated archive as success.
+	defer func() {
+		if cerr := gzipWriter.Close(); cerr != nil {
+			err = errors.Join(err, fmt.Errorf("failed to finalize gzip stream: %w", cerr))
+		}
+	}()
+
+	// copy the contents from the source to the gzip writer
+	if _, err := io.Copy(gzipWriter, src); err != nil {
+		return fmt.Errorf("failed to write compressed data: %w", err)
 	}
 
 	return nil

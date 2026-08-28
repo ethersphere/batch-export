@@ -152,3 +152,38 @@ func TestAppendLogsAsyncClosesWriterOnCancel(t *testing.T) {
 		t.Error("writer was left open after cancellation")
 	}
 }
+
+// closeFailWriter accepts all writes but fails on Close, mimicking a file
+// whose OS-buffered data cannot be flushed (disk full, quota, network fs).
+type closeFailWriter struct{ closeErr error }
+
+func (w *closeFailWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *closeFailWriter) Close() error                { return w.closeErr }
+
+func TestAppendLogsAsyncReportsCloseError(t *testing.T) {
+	t.Parallel()
+
+	closeErr := errors.New("flush to disk failed")
+
+	err := filestore.AppendLogsAsync(t.Context(), feed(1), &closeFailWriter{closeErr: closeErr}, nil)
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("AppendLogsAsync() error = %v, want close error %v", err, closeErr)
+	}
+}
+
+func TestAppendLogsAsyncKeepsContextErrorOnCloseFailure(t *testing.T) {
+	t.Parallel()
+
+	closeErr := errors.New("flush to disk failed")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := filestore.AppendLogsAsync(ctx, make(chan types.Log), &closeFailWriter{closeErr: closeErr}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("AppendLogsAsync() error = %v, want context.Canceled", err)
+	}
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("AppendLogsAsync() error = %v, want close error %v", err, closeErr)
+	}
+}
