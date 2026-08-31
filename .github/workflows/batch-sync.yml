@@ -151,28 +151,33 @@ jobs:
             --slim=true \
             --verbosity "${VERBOSITY}"
 
+      # --old is the file Publish overwrites (main's current archive), not the
+      # resumed tag: a non-tip archive_tag could otherwise verify clean against
+      # the tag while still losing entries main already has. A failure stops
+      # the job before any commit or tag exists.
+      - name: Verify snapshot
+        id: verify
+        run: |
+          set -euo pipefail
+          last_block="$(./dist/batch-export verify --old batch-archive/archive/export.ndjson.gzip --new snapshot.ndjson.gzip)"
+          echo "last_block=${last_block}" >> "${GITHUB_OUTPUT}"
+
       - name: Publish to batch-archive
         env:
           TRIGGERED_BY: ${{ github.actor }}
+          LAST_BLOCK: ${{ steps.verify.outputs.last_block }}
         run: |
           set -euo pipefail
+          # Empty only if Verify was skipped or reordered; never commit without it.
+          : "${LAST_BLOCK:?the verify step reported no block number}"
           cp snapshot.ndjson.gzip batch-archive/archive/export.ndjson.gzip
           cd batch-archive
 
+          # Never fires today: a resumed gzip export always appends a member.
           if git diff --quiet; then
             echo "::notice::snapshot is unchanged; nothing to publish"
             exit 0
           fi
-
-          # blockNumber is hex ("0x...") in the slim NDJSON; the commit title
-          # uses decimal, matching the archive's history.
-          last_block_hex="$(gunzip -c archive/export.ndjson.gzip | tail -n 1 \
-            | sed -nE 's/.*"blockNumber":"(0x[0-9a-fA-F]+)".*/\1/p')"
-          if [ -z "${last_block_hex}" ]; then
-            echo "::error::could not read blockNumber from the last snapshot entry"
-            exit 1
-          fi
-          last_block="$(printf '%d' "${last_block_hex}")"
 
           # Bump the highest existing semver tag, not the resume tag, so an
           # older resume can't collide; non-semver tags are ignored.
@@ -188,10 +193,10 @@ jobs:
           git config user.email "41898470+github-actions[bot]@users.noreply.github.com"
           git add archive/export.ndjson.gzip
           git commit \
-            -m "chore: update snapshot to block number ${last_block}" \
+            -m "chore: update snapshot to block number ${LAST_BLOCK}" \
             -m "Resumed from tag ${ARCHIVE_TAG} and exported up to the latest finalized block. Triggered by @${TRIGGERED_BY} via ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           git tag "${new_tag}"
           # --atomic: a rejected push to main rejects the tag too, so no
           # orphaned tag can become a later run's resume point.
           git push --atomic origin HEAD:main "refs/tags/${new_tag}"
-          echo "::notice::published snapshot at block ${last_block} as ${new_tag} (resumed from ${ARCHIVE_TAG})"
+          echo "::notice::published snapshot at block ${LAST_BLOCK} as ${new_tag} (resumed from ${ARCHIVE_TAG})"

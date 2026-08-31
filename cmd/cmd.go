@@ -52,6 +52,10 @@ func newCommand() (c *command, err error) {
 		return nil, err
 	}
 
+	if err := c.initVerifyCmd(); err != nil {
+		return nil, err
+	}
+
 	return c, nil
 }
 

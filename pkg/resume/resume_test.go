@@ -1256,3 +1256,61 @@ func TestPrepareOutputInvalidDirectory(t *testing.T) {
 		t.Fatal("input was modified on failed PrepareOutput")
 	}
 }
+
+func TestParseEntry(t *testing.T) {
+	t.Parallel()
+
+	cursor, err := resume.ParseEntry(ndjson(t, testLog(7, 3)))
+	if err != nil {
+		t.Fatalf("ParseEntry: %v", err)
+	}
+	if cursor.BlockNumber != 7 || cursor.LogIndex != 3 {
+		t.Fatalf("got (%d, %d), want (7, 3)", cursor.BlockNumber, cursor.LogIndex)
+	}
+
+	if _, err := resume.ParseEntry([]byte(`{"foo":1}`)); err == nil {
+		t.Fatal("want an error for a line missing blockNumber and logIndex")
+	}
+}
+
+func TestOpenClean(t *testing.T) {
+	t.Parallel()
+
+	content := ndjson(t, testLog(1, 0), testLog(2, 0))
+
+	tests := []struct {
+		name string
+		file string
+		blob []byte
+	}{
+		{nameFormatPlain, plainFile, content},
+		{nameFormatGzip, gzipFile, gz(t, content)},
+		{"plain with interrupted tail", plainFile, append(slices.Clone(content), `{"blockNu`...)},
+		{"gzip with interrupted tail", gzipFile, truncateLast(append(gz(t, content), gz(t, ndjson(t, testLog(3, 0)))...), 4)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := write(t, tc.file, tc.blob)
+			cursor, err := resume.Read(path)
+			if err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+
+			r, err := cursor.OpenClean(path)
+			if err != nil {
+				t.Fatalf("OpenClean: %v", err)
+			}
+			defer r.Close()
+
+			got, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("reading clean content: %v", err)
+			}
+			if !bytes.Equal(got, content) {
+				t.Fatalf("clean content mismatch:\ngot  %q\nwant %q", got, content)
+			}
+		})
+	}
+}

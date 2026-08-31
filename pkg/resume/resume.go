@@ -34,6 +34,11 @@ var (
 	// complete entry to resume from: it is empty, or holds only an
 	// interrupted first write. The remedy is a fresh export.
 	ErrNoLogs = errors.New("no complete log entry found")
+
+	// errLineTooLong indicates a line over maxLineBytes.
+	errLineTooLong = errors.New("line exceeds the maximum length")
+	// errPartialLine indicates a stream ending without a final newline.
+	errPartialLine = errors.New("line ends without a newline")
 )
 
 // Cursor marks the last log entry saved by a previous export, together with
@@ -54,12 +59,18 @@ type Cursor struct {
 	Truncated bool
 }
 
+// Before reports whether the cursor's entry precedes the entry at
+// (blockNumber, logIndex) in export order.
+func (c *Cursor) Before(blockNumber uint64, logIndex uint) bool {
+	if blockNumber != c.BlockNumber {
+		return blockNumber > c.BlockNumber
+	}
+	return logIndex > c.LogIndex
+}
+
 // Skip reports whether l was already written to the file the cursor came from.
 func (c *Cursor) Skip(l types.Log) bool {
-	if l.BlockNumber != c.BlockNumber {
-		return l.BlockNumber < c.BlockNumber
-	}
-	return l.Index <= c.LogIndex
+	return !c.Before(l.BlockNumber, l.Index)
 }
 
 // PrepareOutput readies outputPath for appending the continuation of the
@@ -231,7 +242,7 @@ func lastCursorPlain(file *os.File, size int64) (*Cursor, error) {
 	if start == 0 && offset > 0 {
 		return nil, fmt.Errorf("%w: final line is over %d bytes long", ErrNotAnExport, nl)
 	}
-	cursor, err := parseCursor(buf[start:nl])
+	cursor, err := ParseEntry(buf[start:nl])
 	if err != nil {
 		return nil, fmt.Errorf("%w: final complete line at offset %d is not a log entry: %w", ErrNotAnExport, offset+int64(start), err)
 	}
@@ -352,31 +363,54 @@ func scanMember(r io.Reader, member int) (*Cursor, error) {
 		lineNum = 1
 	)
 	for {
-		chunk, err := buffered.ReadSlice('\n')
-		line = append(line, chunk...)
-		if len(line) > maxLineBytes {
+		var err error
+		line, err = ReadLine(line[:0], buffered)
+		switch {
+		case errors.Is(err, errLineTooLong):
 			return nil, fmt.Errorf("%w: member %d, line %d exceeds %d bytes", ErrNotAnExport, member, lineNum, maxLineBytes)
+		case errors.Is(err, errPartialLine):
+			return nil, fmt.Errorf("%w: member %d, line %d ends mid-line", ErrNotAnExport, member, lineNum)
+		case errors.Is(err, io.EOF):
+			return last, nil
+		case err != nil:
+			return last, err
+		}
+
+		cursor, err := ParseEntry(line)
+		if err != nil {
+			return nil, fmt.Errorf("%w: member %d, line %d is not a log entry: %w", ErrNotAnExport, member, lineNum, err)
+		}
+		last = cursor
+		lineNum++
+	}
+}
+
+// ReadLine appends the next newline-terminated line from r to dst and returns
+// the extended buffer; pass dst[:0] to reuse it across calls. A clean end of
+// stream returns io.EOF. A final line with no newline — an interrupted write —
+// and a line longer than any this tool writes are both returned as errors for
+// the caller to wrap with the sentinel that fits its context.
+func ReadLine(dst []byte, r *bufio.Reader) ([]byte, error) {
+	for {
+		chunk, err := r.ReadSlice('\n')
+		dst = append(dst, chunk...)
+		if len(dst) > maxLineBytes {
+			return dst, errLineTooLong
 		}
 
 		switch {
 		case errors.Is(err, bufio.ErrBufferFull):
 			continue
 		case errors.Is(err, io.EOF):
-			if len(line) > 0 {
-				return nil, fmt.Errorf("%w: member %d, line %d ends mid-line", ErrNotAnExport, member, lineNum)
+			if len(dst) > 0 {
+				return dst, errPartialLine
 			}
-			return last, nil
+			return dst, io.EOF
 		case err != nil:
-			return last, err
+			return dst, err
 		}
 
-		cursor, err := parseCursor(line)
-		if err != nil {
-			return nil, fmt.Errorf("%w: member %d, line %d is not a log entry: %w", ErrNotAnExport, member, lineNum, err)
-		}
-		last = cursor
-		line = line[:0]
-		lineNum++
+		return dst, nil
 	}
 }
 
@@ -408,9 +442,10 @@ func (c *countingReader) ReadByte() (byte, error) {
 	return b, err
 }
 
-// parseCursor builds a cursor from a single NDJSON line. Callers wrap the
-// returned error with the sentinel that fits their context.
-func parseCursor(line []byte) (*Cursor, error) {
+// ParseEntry builds a cursor from a single exported NDJSON line, in either
+// the slim or the full log shape. Callers wrap the returned error with the
+// sentinel that fits their context.
+func ParseEntry(line []byte) (*Cursor, error) {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
 		return nil, errors.New("blank line")
@@ -429,3 +464,33 @@ func parseCursor(line []byte) (*Cursor, error) {
 		LogIndex:    uint(*parsed.LogIndex),
 	}, nil
 }
+
+// OpenClean returns the clean content at path, decompressed. The cursor must
+// come from Read on that same, unmodified file.
+func (c *Cursor) OpenClean(path string) (io.ReadCloser, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("error opening resume file: %w", err)
+	}
+
+	limited := io.LimitReader(file, c.CleanSize)
+	if !c.Compressed {
+		return &cleanReader{Reader: limited, closer: file}, nil
+	}
+
+	gz, err := gzip.NewReader(bufio.NewReaderSize(limited, bufferSize))
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("error reading gzip resume file: %w", err)
+	}
+
+	return &cleanReader{Reader: gz, closer: file}, nil
+}
+
+// cleanReader pairs the decompressed stream with the file it draws from.
+type cleanReader struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (r *cleanReader) Close() error { return r.closer.Close() }
