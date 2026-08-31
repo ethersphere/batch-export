@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethersphere/batch-export/pkg/filestore"
+	"github.com/ethersphere/batch-export/pkg/resume"
 	"github.com/ethersphere/batch-export/pkg/verify"
 )
 
@@ -109,5 +112,117 @@ func TestVerifyIdentical(t *testing.T) {
 	}
 	if res.LastBlock != 2 || res.Appended != 0 {
 		t.Errorf("got LastBlock=%d Appended=%d, want 2 and 0", res.LastBlock, res.Appended)
+	}
+}
+
+func TestVerifyRefusals(t *testing.T) {
+	t.Parallel()
+
+	oldContent := ndjson(t, testLog(1, 0), testLog(2, 0))
+
+	// mutated flips one byte inside the first entry's blockNumber.
+	mutated := bytes.Replace(slices.Clone(oldContent), []byte(`"blockNumber":"0x1"`), []byte(`"blockNumber":"0x9"`), 1)
+
+	tests := []struct {
+		name    string
+		old     []byte
+		new     []byte
+		wantErr error
+	}{
+		{
+			name:    "mutated entry inside the old content",
+			old:     gz(t, oldContent),
+			new:     gz(t, append(mutated, ndjson(t, testLog(10, 0))...)),
+			wantErr: verify.ErrMismatch,
+		},
+		{
+			name:    "dropped entry",
+			old:     gz(t, oldContent),
+			new:     gz(t, ndjson(t, testLog(1, 0), testLog(3, 0))),
+			wantErr: verify.ErrMismatch,
+		},
+		{
+			name:    "new shorter than old",
+			old:     gz(t, oldContent),
+			new:     gz(t, ndjson(t, testLog(1, 0))),
+			wantErr: verify.ErrMismatch,
+		},
+		{
+			name:    "appended entry repeats the cursor",
+			old:     gz(t, oldContent),
+			new:     append(gz(t, oldContent), gz(t, ndjson(t, testLog(2, 0)))...),
+			wantErr: verify.ErrOrder,
+		},
+		{
+			name:    "appended entries out of order",
+			old:     gz(t, oldContent),
+			new:     append(gz(t, oldContent), gz(t, ndjson(t, testLog(5, 0), testLog(4, 0)))...),
+			wantErr: verify.ErrOrder,
+		},
+		{
+			name:    "new ends in an interrupted write",
+			old:     oldContent,
+			new:     append(slices.Clone(oldContent), `{"blockNumber":"0x3"`...),
+			wantErr: verify.ErrTruncatedNew,
+		},
+		{
+			name:    "old holds no complete entry",
+			old:     nil,
+			new:     oldContent,
+			wantErr: resume.ErrNoLogs,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := verify.Verify(
+				write(t, "old", tc.old),
+				write(t, "new", tc.new),
+			)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Verify error = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestVerifyMalformedAppendedLine(t *testing.T) {
+	t.Parallel()
+
+	oldContent := ndjson(t, testLog(1, 0), testLog(2, 0))
+	// The middle appended line is valid JSON but not a log entry; resume.Read
+	// on a plain file only inspects the tail, so only checkTail can catch it.
+	newContent := append(slices.Clone(oldContent), "{\"foo\":1}\n"...)
+	newContent = append(newContent, ndjson(t, testLog(3, 0))...)
+
+	_, err := verify.Verify(
+		write(t, "old", oldContent),
+		write(t, "new", newContent),
+	)
+	if err == nil {
+		t.Fatal("want an error for a malformed appended line")
+	}
+}
+
+func TestVerifyOldTruncated(t *testing.T) {
+	t.Parallel()
+
+	oldContent := ndjson(t, testLog(1, 0), testLog(2, 0))
+	oldBlob := append(slices.Clone(oldContent), `{"block`...)
+	newBlob := append(slices.Clone(oldContent), ndjson(t, testLog(3, 0))...)
+
+	res, err := verify.Verify(
+		write(t, "old", oldBlob),
+		write(t, "new", newBlob),
+	)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !res.OldTruncated {
+		t.Error("OldTruncated = false, want true")
+	}
+	if res.LastBlock != 3 || res.Appended != 1 {
+		t.Errorf("got LastBlock=%d Appended=%d, want 3 and 1", res.LastBlock, res.Appended)
 	}
 }
