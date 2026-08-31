@@ -151,6 +151,13 @@ jobs:
             --slim=true \
             --verbosity "${VERBOSITY}"
 
+      # A failed verification stops the job before any commit or tag exists.
+      - name: Verify snapshot
+        run: |
+          set -euo pipefail
+          last_block="$(./dist/batch-export verify --old resume.ndjson.gzip --new snapshot.ndjson.gzip)"
+          echo "LAST_BLOCK=${last_block}" >> "${GITHUB_ENV}"
+
       - name: Publish to batch-archive
         env:
           TRIGGERED_BY: ${{ github.actor }}
@@ -163,16 +170,6 @@ jobs:
             echo "::notice::snapshot is unchanged; nothing to publish"
             exit 0
           fi
-
-          # blockNumber is hex ("0x...") in the slim NDJSON; the commit title
-          # uses decimal, matching the archive's history.
-          last_block_hex="$(gunzip -c archive/export.ndjson.gzip | tail -n 1 \
-            | sed -nE 's/.*"blockNumber":"(0x[0-9a-fA-F]+)".*/\1/p')"
-          if [ -z "${last_block_hex}" ]; then
-            echo "::error::could not read blockNumber from the last snapshot entry"
-            exit 1
-          fi
-          last_block="$(printf '%d' "${last_block_hex}")"
 
           # Bump the highest existing semver tag, not the resume tag, so an
           # older resume can't collide; non-semver tags are ignored.
@@ -188,10 +185,10 @@ jobs:
           git config user.email "41898470+github-actions[bot]@users.noreply.github.com"
           git add archive/export.ndjson.gzip
           git commit \
-            -m "chore: update snapshot to block number ${last_block}" \
+            -m "chore: update snapshot to block number ${LAST_BLOCK}" \
             -m "Resumed from tag ${ARCHIVE_TAG} and exported up to the latest finalized block. Triggered by @${TRIGGERED_BY} via ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           git tag "${new_tag}"
           # --atomic: a rejected push to main rejects the tag too, so no
           # orphaned tag can become a later run's resume point.
           git push --atomic origin HEAD:main "refs/tags/${new_tag}"
-          echo "::notice::published snapshot at block ${last_block} as ${new_tag} (resumed from ${ARCHIVE_TAG})"
+          echo "::notice::published snapshot at block ${LAST_BLOCK} as ${new_tag} (resumed from ${ARCHIVE_TAG})"
