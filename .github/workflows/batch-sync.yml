@@ -36,9 +36,9 @@ on:
         default: "15"
         type: string
       block_range_limit:
-        description: "Max blocks per eth_getLogs query (keep low; large ranges can OOM the node)"
+        description: "Max blocks per eth_getLogs query (very large ranges can strain the node)"
         required: true
-        default: "5"
+        default: "10000"
         type: string
       verbosity:
         description: "Log verbosity"
