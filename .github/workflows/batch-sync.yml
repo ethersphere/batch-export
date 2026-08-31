@@ -6,8 +6,11 @@ name: Batch Sync
 # the latest semver tag when left empty.
 #
 # The snapshot is a gzipped NDJSON file; resuming a compressed file yields a
-# compressed result, and --start is dictated by the resume cursor, which is why
-# neither is an input here.
+# compressed result, --start is dictated by the resume cursor, and the export
+# always runs to the latest finalized block — a hand-picked --end past the
+# finalized head could commit logs from a block that later reorgs, and an
+# append-only archive can never shed them. That is why none of the three is
+# an input here.
 #
 # Runner: the self-hosted `bee` runners are inside the RPC's network allowlist,
 # so they reach the endpoint without credentials. If this is ever moved to a
@@ -24,11 +27,6 @@ on:
         description: "batch-archive tag to resume from (empty = latest)"
         required: false
         default: ""
-        type: string
-      end_block:
-        description: "End block (0 = latest finalized)"
-        required: true
-        default: "0"
         type: string
       max_request:
         description: "Max RPC requests per second"
@@ -144,17 +142,17 @@ jobs:
       # which lets a crafted input inject shell on the runner.
       - name: Export
         env:
-          END_BLOCK: ${{ inputs.end_block }}
           MAX_REQUEST: ${{ inputs.max_request }}
           BLOCK_RANGE_LIMIT: ${{ inputs.block_range_limit }}
           VERBOSITY: ${{ inputs.verbosity }}
         run: |
           set -euo pipefail
+          # No --end: the CLI defaults to the latest finalized block, the only
+          # reorg-safe end for an append-only archive.
           ./dist/batch-export export \
             --endpoint "${RPC_ENDPOINT}" \
             --resume resume.ndjson.gzip \
             --output snapshot.ndjson.gzip \
-            --end "${END_BLOCK}" \
             --max-request "${MAX_REQUEST}" \
             --block-range-limit "${BLOCK_RANGE_LIMIT}" \
             --slim=true \
@@ -196,7 +194,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898470+github-actions[bot]@users.noreply.github.com"
           git add archive/export.ndjson.gzip
-          git commit -m "chore: update snapshot to block number ${last_block}"
+          git commit \
+            -m "chore: update snapshot to block number ${last_block}" \
+            -m "Resumed from tag ${ARCHIVE_TAG} and exported up to the latest finalized block by the Batch Sync workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           git tag "${new_tag}"
           # --atomic: if main was pushed to during the run, reject the commit
           # AND the tag together — a lone orphaned tag would become the next
