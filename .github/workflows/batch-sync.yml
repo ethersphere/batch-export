@@ -15,9 +15,10 @@ name: Batch Sync
 # Security: dispatch inputs reach run: scripts only via env — `${{ }}`
 # interpolation inside run: lets a crafted input inject shell.
 #
-# Secrets: GHA_PAT_BASIC needs contents:write on ethersphere/batch-archive;
-# PRIVATE_GNOSIS_RPC_URL is required; GNOSIS_RPC_USER / GNOSIS_RPC_PASSWORD
-# are needed only off-allowlist.
+# Secrets: BEE_RUNNER_APP_ID / BEE_RUNNER_KEY mint a short-lived App token
+# scoped to ethersphere/batch-archive for the publish push (the App is already
+# installed org-wide with contents:write); PRIVATE_GNOSIS_RPC_URL is required;
+# GNOSIS_RPC_USER / GNOSIS_RPC_PASSWORD are needed only off-allowlist.
 
 on:
   workflow_dispatch:
@@ -82,7 +83,11 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: ethersphere/batch-archive
-          token: ${{ secrets.GHA_PAT_BASIC }}
+          # Public repo: the default token can read it. Write happens at the end
+          # with an App token, so no long-lived credential sits in .git/config
+          # for the length of the export.
+          token: ${{ github.token }}
+          persist-credentials: false
           path: batch-archive
           fetch-depth: 0
 
@@ -151,9 +156,23 @@ jobs:
             --slim=true \
             --verbosity "${VERBOSITY}"
 
+      # Minted here, not at checkout: an App token lives ~1h and the export
+      # above can outrun that. permission-contents keeps it to what the push
+      # needs, and repositories keeps it off every other repo in the org.
+      - name: Generate token for batch-archive
+        id: archive-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BEE_RUNNER_APP_ID }}
+          private-key: ${{ secrets.BEE_RUNNER_KEY }}
+          owner: ethersphere
+          repositories: batch-archive
+          permission-contents: write
+
       - name: Publish to batch-archive
         env:
           TRIGGERED_BY: ${{ github.actor }}
+          ARCHIVE_TOKEN: ${{ steps.archive-token.outputs.token }}
         run: |
           set -euo pipefail
           cp snapshot.ndjson.gzip batch-archive/archive/export.ndjson.gzip
@@ -193,5 +212,7 @@ jobs:
           git tag "${new_tag}"
           # --atomic: a rejected push to main rejects the tag too, so no
           # orphaned tag can become a later run's resume point.
-          git push --atomic origin HEAD:main "refs/tags/${new_tag}"
+          git push --atomic \
+            "https://x-access-token:${ARCHIVE_TOKEN}@github.com/ethersphere/batch-archive.git" \
+            HEAD:main "refs/tags/${new_tag}"
           echo "::notice::published snapshot at block ${last_block} as ${new_tag} (resumed from ${ARCHIVE_TAG})"
