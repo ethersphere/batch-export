@@ -1,24 +1,23 @@
 name: Batch Sync
 
 # Resumes the postage-batch snapshot kept in ethersphere/batch-archive and
-# publishes the refreshed file back there: commit on main plus a new patch tag
-# (vX.Y.Z -> vX.Y.Z+1). The resume point is a batch-archive tag — an input, or
-# the latest semver tag when left empty.
+# publishes the refreshed file back there: a commit on main plus the next
+# patch tag (vX.Y.Z -> vX.Y.Z+1).
 #
-# The snapshot is a gzipped NDJSON file; resuming a compressed file yields a
-# compressed result, --start is dictated by the resume cursor, and the export
-# always runs to the latest finalized block — a hand-picked --end past the
-# finalized head could commit logs from a block that later reorgs, and an
-# append-only archive can never shed them. That is why none of the three is
-# an input here.
+# --start follows the resume cursor, --end always resolves to the latest
+# finalized block (a not-yet-finalized block can reorg, and an append-only
+# archive can never shed its logs), and a resumed .gzip stays gzip — so
+# none of the three is an input.
 #
-# Runner: the self-hosted `bee` runners are inside the RPC's network allowlist,
-# so they reach the endpoint without credentials. If this is ever moved to a
-# GitHub-hosted runner, the endpoint requires HTTP Basic auth — see the
-# "Compose endpoint" step.
+# Runner: the self-hosted `bee` runners sit inside the RPC's IP allowlist;
+# see "Compose endpoint" for what changes on a GitHub-hosted runner.
 #
-# Secrets: GHA_PAT_BASIC must have contents:write on ethersphere/batch-archive
-# — it authenticates the checkout and the push of the commit and tag.
+# Security: dispatch inputs reach run: scripts only via env — `${{ }}`
+# interpolation inside run: lets a crafted input inject shell.
+#
+# Secrets: GHA_PAT_BASIC needs contents:write on ethersphere/batch-archive;
+# PRIVATE_GNOSIS_RPC_URL is required; GNOSIS_RPC_USER / GNOSIS_RPC_PASSWORD
+# are needed only off-allowlist.
 
 on:
   workflow_dispatch:
@@ -54,6 +53,7 @@ permissions:
 
 concurrency:
   group: batch-sync
+  # Never cancel a run that may be mid-publish of the commit and tag.
   cancel-in-progress: false
 
 jobs:
@@ -72,8 +72,7 @@ jobs:
           cache: true
           go-version-file: go.mod
 
-      # `make binary` (not `make build`) is the target that emits dist/batch-export;
-      # `make build` only runs `go build ./...` and produces no artifact.
+      # make binary (not make build) is the target that emits dist/batch-export.
       - name: Build
         run: make binary
 
@@ -110,10 +109,8 @@ jobs:
           git show "${archive_tag}:archive/export.ndjson.gzip" > ../resume.ndjson.gzip
           echo "ARCHIVE_TAG=${archive_tag}" >> "${GITHUB_ENV}"
 
-      # The bare URL works from the self-hosted runners because their egress IPs
-      # are allowlisted. USER/PASSWORD are only needed off-allowlist; when they
-      # are absent the bare URL is used unchanged. Secrets are masked in logs,
-      # and the composed value is written to GITHUB_ENV rather than echoed.
+      # Self-hosted runners are IP-allowlisted, so RPC_USER/PASSWORD are only
+      # needed off-allowlist; when unset, the bare URL is used unchanged.
       - name: Compose endpoint
         env:
           RPC_URL: ${{ secrets.PRIVATE_GNOSIS_RPC_URL }}
@@ -137,9 +134,6 @@ jobs:
           echo "::add-mask::${endpoint}"
           echo "RPC_ENDPOINT=${endpoint}" >> "${GITHUB_ENV}"
 
-      # Inputs are routed through env rather than interpolated into the script:
-      # a `${{ inputs.* }}` inside `run` is substituted before bash parses it,
-      # which lets a crafted input inject shell on the runner.
       - name: Export
         env:
           MAX_REQUEST: ${{ inputs.max_request }}
@@ -147,8 +141,7 @@ jobs:
           VERBOSITY: ${{ inputs.verbosity }}
         run: |
           set -euo pipefail
-          # No --end: the CLI defaults to the latest finalized block, the only
-          # reorg-safe end for an append-only archive.
+          # No --end: always the latest finalized block (see header).
           ./dist/batch-export export \
             --endpoint "${RPC_ENDPOINT}" \
             --resume resume.ndjson.gzip \
@@ -179,10 +172,8 @@ jobs:
           fi
           last_block="$(printf '%d' "${last_block_hex}")"
 
-          # Bump the patch of the highest existing semver tag, not of the
-          # resume tag, so resuming an older tag can never collide with an
-          # existing tag. Non-semver tags (pre-releases included) are ignored
-          # rather than parsed into a malformed bump.
+          # Bump the highest existing semver tag, not the resume tag, so an
+          # older resume can't collide; non-semver tags are ignored.
           latest_tag="$(git tag | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
           if [ -z "${latest_tag}" ]; then
             echo "::error::batch-archive has no semver tag (vX.Y.Z) to bump"
@@ -198,8 +189,7 @@ jobs:
             -m "chore: update snapshot to block number ${last_block}" \
             -m "Resumed from tag ${ARCHIVE_TAG} and exported up to the latest finalized block by the Batch Sync workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           git tag "${new_tag}"
-          # --atomic: if main was pushed to during the run, reject the commit
-          # AND the tag together — a lone orphaned tag would become the next
-          # run's resume point and clobber main's newer content.
+          # --atomic: a rejected push to main rejects the tag too, so no
+          # orphaned tag can become a later run's resume point.
           git push --atomic origin HEAD:main "refs/tags/${new_tag}"
           echo "::notice::published snapshot at block ${last_block} as ${new_tag} (resumed from ${ARCHIVE_TAG})"
