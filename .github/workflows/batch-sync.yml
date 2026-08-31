@@ -64,6 +64,20 @@ jobs:
     timeout-minutes: 120
 
     steps:
+      # Preflight: the real token is minted after the export (see below), which
+      # would push an App misconfiguration — lost contents:write, key no longer
+      # shared with this repo — to the end of a run that can take two hours.
+      # Minting once up front fails in seconds instead. This token is never
+      # used; create-github-app-token revokes it in its post step.
+      - name: Verify batch-archive App access
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BEE_RUNNER_APP_ID }}
+          private-key: ${{ secrets.BEE_RUNNER_KEY }}
+          owner: ethersphere
+          repositories: batch-archive
+          permission-contents: write
+
       - name: Checkout
         uses: actions/checkout@v5
 
@@ -212,7 +226,10 @@ jobs:
           git tag "${new_tag}"
           # --atomic: a rejected push to main rejects the tag too, so no
           # orphaned tag can become a later run's resume point.
-          git push --atomic \
-            "https://x-access-token:${ARCHIVE_TOKEN}@github.com/ethersphere/batch-archive.git" \
-            HEAD:main "refs/tags/${new_tag}"
+          # A token in the remote URL lands in git's argv, readable via
+          # `ps -eo args` by anything else on these long-lived shared runners.
+          # A credential helper reads it from the environment instead; the
+          # helper written to .git/config holds no secret itself.
+          git config credential.helper '!f() { echo username=x-access-token; echo "password=${ARCHIVE_TOKEN}"; }; f'
+          git push --atomic origin HEAD:main "refs/tags/${new_tag}"
           echo "::notice::published snapshot at block ${last_block} as ${new_tag} (resumed from ${ARCHIVE_TAG})"
