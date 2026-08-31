@@ -226,3 +226,37 @@ func TestVerifyOldTruncated(t *testing.T) {
 		t.Errorf("got LastBlock=%d Appended=%d, want 3 and 1", res.LastBlock, res.Appended)
 	}
 }
+
+func TestVerifyFormatCombinations(t *testing.T) {
+	t.Parallel()
+
+	oldContent := ndjson(t, testLog(1, 0), testLog(2, 0))
+	newContent := append(slices.Clone(oldContent), ndjson(t, testLog(3, 0))...)
+
+	tests := []struct {
+		name string
+		old  []byte
+		new  []byte
+	}{
+		{"plain old, plain new", oldContent, newContent},
+		{"plain old, gzip new", oldContent, gz(t, newContent)},
+		{"gzip old, plain new", gz(t, oldContent), newContent},
+		{"gzip old, gzip new", gz(t, oldContent), gz(t, newContent)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, err := verify.Verify(
+				write(t, "old", tc.old),
+				write(t, "new", tc.new),
+			)
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+			if res.LastBlock != 3 || res.Appended != 1 {
+				t.Errorf("got LastBlock=%d Appended=%d, want 3 and 1", res.LastBlock, res.Appended)
+			}
+		})
+	}
+}
