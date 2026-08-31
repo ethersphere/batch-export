@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/core/types"
 	ethclient "github.com/ethersphere/batch-export/pkg/ethclientwrapper"
 	"github.com/ethersphere/batch-export/pkg/eventfetcher"
 	"github.com/ethersphere/batch-export/pkg/filestore"
 	"github.com/ethersphere/batch-export/pkg/gzipstore"
+	"github.com/ethersphere/batch-export/pkg/resume"
 	"github.com/ethersphere/bee/v2/pkg/config"
 	"github.com/ethersphere/bee/v2/pkg/util/abiutil"
 	"github.com/spf13/cobra"
@@ -25,6 +29,10 @@ func (c *command) initExportCmd() (err error) {
 		blockRangeLimit uint32
 		outputFile      string
 		compress        bool
+		resumeFile      string
+		slim            bool
+		retryMax        int
+		retryDelay      time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -32,14 +40,57 @@ func (c *command) initExportCmd() (err error) {
 		Short: "Export Swarm Postage Stamp contract event logs within a block range.",
 		Long: `Exports event logs for the Swarm Postage Stamp contract from a specified Ethereum RPC endpoint
 within a given block range (--start to --end). It handles large ranges by querying in chunks (--block-range-limit)
-and respects RPC rate limits (--max-request).
+and respects RPC rate limits (--max-request). Requests failing with a transient network error are retried
+with an exponential backoff (--retry-max, --retry-delay).
 
 The retrieved logs are saved to the specified output file (default: 'export.ndjson') in NDJSON format.
 The process can be interrupted at any time (Ctrl+C), and it will attempt to save already retrieved logs before exiting.`,
 		RunE: func(cmd *cobra.Command, args []string) (err error) {
-			ctx := cmd.Context()
+			ctx, cancel := context.WithCancel(cmd.Context())
+			defer cancel()
 
-			ec, err := ethclient.NewClient(ctx, rpcEndpoint, ethclient.WithRateLimit(maxRequest), ethclient.WithLogger(c.log))
+			var cursor *resume.Cursor
+			if resumeFile != "" {
+				cursor, err = resume.Read(resumeFile)
+				if err != nil {
+					return fmt.Errorf("failed to read resume file %q: %w", resumeFile, err)
+				}
+
+				if cmd.Flags().Changed("start") {
+					c.log.Warning("--start is ignored when --resume is set", "resumeFile", resumeFile)
+				}
+				if compress {
+					c.log.Warning("--compress is ignored when resuming; resume a compressed file to get a compressed result", "resumeFile", resumeFile)
+					compress = false
+				}
+				// An unset --output means in-place; so does naming the input.
+				if !cmd.Flags().Changed("output") || filepath.Clean(outputFile) == filepath.Clean(resumeFile) {
+					outputFile = resumeFile
+				}
+
+				startBlock = cursor.BlockNumber
+
+				c.log.Info("Resuming export",
+					"resumeFile", resumeFile,
+					"outputFile", outputFile,
+					"startBlock", startBlock,
+					"lastLogIndex", cursor.LogIndex,
+					"compressed", cursor.Compressed,
+				)
+			}
+
+			if retryMax < 0 {
+				return fmt.Errorf("invalid --retry-max %d: must not be negative", retryMax)
+			}
+			if retryDelay <= 0 {
+				return fmt.Errorf("invalid --retry-delay %s: must be greater than zero", retryDelay)
+			}
+
+			ec, err := ethclient.NewClient(ctx, rpcEndpoint,
+				ethclient.WithRateLimit(maxRequest),
+				ethclient.WithLogger(c.log),
+				ethclient.WithRetry(retryMax, retryDelay),
+			)
 			if err != nil {
 				return fmt.Errorf("failed to connect to the Ethereum client: %w", err)
 			}
@@ -63,6 +114,28 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 				startBlock = chainCfg.PostageStampStartBlock
 			}
 
+			if cursor != nil {
+				discarded, err := resume.PrepareOutput(cursor, resumeFile, outputFile)
+				if err != nil {
+					return err
+				}
+				if discarded > 0 {
+					c.log.Warning("previous export ends with an interrupted write, leaving it out",
+						"resumeFile", resumeFile,
+						"offset", cursor.CleanSize,
+						"discardedBytes", discarded,
+					)
+				}
+			}
+
+			// Opened before the first log is fetched: from inside the saving
+			// goroutine, a failure here would leave the fetcher pushing into a
+			// channel nobody drains.
+			w, err := openOutput(outputFile, cursor)
+			if err != nil {
+				return fmt.Errorf("failed to open output file: %w", err)
+			}
+
 			c.log.Info("Retrieving logs", "startBlock", startBlock, "endBlock", endBlock)
 
 			logChan, errorChan := client.GetLogs(ctx, &eventfetcher.Request{
@@ -77,14 +150,20 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 			ticker := time.NewTicker(15 * time.Second)
 			defer ticker.Stop()
 
+			var saveErr error
 			go func() {
 				defer wg.Done()
-				if err := filestore.SaveLogsAsync(ctx, logChan, outputFile); err != nil {
-					if errors.Is(err, context.Canceled) {
+
+				if err := saveLogs(ctx, logChan, w, cursor, slim); err != nil {
+					if solelyCanceled(err) {
 						c.log.Error(err, "context canceled while saving logs")
 						return
 					}
 					c.log.Error(err, "error saving logs")
+					// Stop the fetcher too: with the saver gone, logChan
+					// would fill and block it forever.
+					saveErr = err
+					cancel()
 					return
 				}
 				c.log.Info("all logs have been saved", "outputFile", outputFile)
@@ -106,12 +185,20 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 					if !ok {
 						errorChan = nil
 					} else {
-						return fmt.Errorf("error retrieving logs: %w", err)
+						wg.Wait()
+						if saveErr != nil && errors.Is(err, context.Canceled) {
+							return saveErr
+						}
+						return errors.Join(fmt.Errorf("error retrieving logs: %w", err), saveErr)
 					}
 				case <-ticker.C:
 					c.log.Info("still retrieving logs...")
 				case <-ctx.Done():
 					c.log.Info("context canceled, waiting for logs to be saved...")
+					wg.Wait()
+					if saveErr != nil {
+						return saveErr
+					}
 					if err := compressFunc(); err != nil {
 						return errors.Join(fmt.Errorf("error compressing file: %w", err), ctx.Err())
 					}
@@ -124,6 +211,9 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 			}
 
 			wg.Wait()
+			if saveErr != nil {
+				return saveErr
+			}
 			if err := compressFunc(); err != nil {
 				return fmt.Errorf("error compressing file: %w", err)
 			}
@@ -133,14 +223,65 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 	}
 
 	cmd.Flags().Uint64VarP(&startBlock, "start", "", 31306381, "Start block (optional, uses contract start block if 0)")
-	cmd.Flags().Uint64VarP(&endBlock, "end", "", 0, "End block (optional, uses latest block if 0)")
+	cmd.Flags().Uint64VarP(&endBlock, "end", "", 0, "End block (optional, uses latest finalized block if 0)")
 	cmd.Flags().StringVarP(&rpcEndpoint, "endpoint", "e", "https://rpc.gnosis.gateway.fm", "Ethereum based RPC endpoint URL")
 	cmd.Flags().IntVarP(&maxRequest, "max-request", "m", 15, "Max RPC requests/sec")
 	cmd.Flags().Uint32VarP(&blockRangeLimit, "block-range-limit", "b", 5, "Max blocks per log query")
 	cmd.Flags().StringVarP(&outputFile, "output", "o", "export.ndjson", "Output file path (NDJSON)")
 	cmd.Flags().BoolVarP(&compress, "compress", "c", false, "Compress to GZIP")
+	cmd.Flags().StringVarP(&resumeFile, "resume", "r", "", "Continue a previous export file (.ndjson, .gz or .gzip); combine with --output to write a new snapshot instead of appending in place")
+	cmd.Flags().BoolVar(&slim, "slim", true, "Emit only the types.Log fields Bee consumes (address, topics, data, blockNumber, transactionHash) plus logIndex to keep exports resumable; pass --slim=false for the full geth types.Log JSON shape")
+	cmd.Flags().IntVarP(&retryMax, "retry-max", "", 5, "Max retries per RPC request on transient network errors (0 disables retrying)")
+	cmd.Flags().DurationVarP(&retryDelay, "retry-delay", "", ethclient.DefaultRetryDelay, "Delay before the first retry, doubling per retry up to 30s")
 
 	c.root.AddCommand(cmd)
 
 	return nil
+}
+
+// openOutput opens the destination for a run's logs: a fresh file when cursor
+// is nil, or a writer that appends to the file the cursor came from.
+func openOutput(outputFile string, cursor *resume.Cursor) (io.WriteCloser, error) {
+	switch {
+	case cursor == nil:
+		return filestore.CreateWriter(outputFile)
+	case cursor.Compressed:
+		return gzipstore.AppendWriter(outputFile)
+	default:
+		return filestore.AppendWriter(outputFile)
+	}
+}
+
+// saveLogs writes logs to w, dropping any entry a resumed export already holds.
+// A nil cursor means the destination starts empty, so every log is kept.
+func saveLogs(ctx context.Context, logChan <-chan types.Log, w io.WriteCloser, cursor *resume.Cursor, slim bool) error {
+	var skip func(types.Log) bool
+	if cursor != nil {
+		skip = cursor.Skip
+	}
+
+	return filestore.AppendLogsAsync(ctx, logChan, w, skip, slim)
+}
+
+// solelyCanceled reports whether err contains nothing beyond context
+// cancellation, unwrapping joined and wrapped errors along the way. It is
+// stricter than errors.Is(err, context.Canceled): AppendLogsAsync joins the
+// save error with the destination's Close error, and a SIGINT racing a
+// failing gzip-member flush must not be reported as pure cancellation.
+func solelyCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	if u, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, e := range u.Unwrap() {
+			if !solelyCanceled(e) {
+				return false
+			}
+		}
+		return true
+	}
+	if u := errors.Unwrap(err); u != nil {
+		return solelyCanceled(u)
+	}
+	return errors.Is(err, context.Canceled)
 }
