@@ -30,6 +30,7 @@ func (c *command) initExportCmd() (err error) {
 		outputFile      string
 		compress        bool
 		resumeFile      string
+		slim            bool
 		retryMax        int
 		retryDelay      time.Duration
 	)
@@ -153,7 +154,7 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 			go func() {
 				defer wg.Done()
 
-				if err := saveLogs(ctx, logChan, w, cursor); err != nil {
+				if err := saveLogs(ctx, logChan, w, cursor, slim); err != nil {
 					if solelyCanceled(err) {
 						c.log.Error(err, "context canceled while saving logs")
 						return
@@ -229,6 +230,7 @@ The process can be interrupted at any time (Ctrl+C), and it will attempt to save
 	cmd.Flags().StringVarP(&outputFile, "output", "o", "export.ndjson", "Output file path (NDJSON)")
 	cmd.Flags().BoolVarP(&compress, "compress", "c", false, "Compress to GZIP")
 	cmd.Flags().StringVarP(&resumeFile, "resume", "r", "", "Continue a previous export file (.ndjson, .gz or .gzip); combine with --output to write a new snapshot instead of appending in place")
+	cmd.Flags().BoolVar(&slim, "slim", true, "Emit only the types.Log fields Bee consumes (address, topics, data, blockNumber, transactionHash) plus logIndex to keep exports resumable; pass --slim=false for the full geth types.Log JSON shape")
 	cmd.Flags().IntVarP(&retryMax, "retry-max", "", 5, "Max retries per RPC request on transient network errors (0 disables retrying)")
 	cmd.Flags().DurationVarP(&retryDelay, "retry-delay", "", ethclient.DefaultRetryDelay, "Delay before the first retry, doubling per retry up to 30s")
 
@@ -252,13 +254,13 @@ func openOutput(outputFile string, cursor *resume.Cursor) (io.WriteCloser, error
 
 // saveLogs writes logs to w, dropping any entry a resumed export already holds.
 // A nil cursor means the destination starts empty, so every log is kept.
-func saveLogs(ctx context.Context, logChan <-chan types.Log, w io.WriteCloser, cursor *resume.Cursor) error {
+func saveLogs(ctx context.Context, logChan <-chan types.Log, w io.WriteCloser, cursor *resume.Cursor, slim bool) error {
 	var skip func(types.Log) bool
 	if cursor != nil {
 		skip = cursor.Skip
 	}
 
-	return filestore.AppendLogsAsync(ctx, logChan, w, skip)
+	return filestore.AppendLogsAsync(ctx, logChan, w, skip, slim)
 }
 
 // solelyCanceled reports whether err contains nothing beyond context

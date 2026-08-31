@@ -499,7 +499,7 @@ func TestAppendResumeRoundTrip(t *testing.T) {
 			}
 			close(ch)
 
-			if err := filestore.AppendLogsAsync(t.Context(), ch, w, cursor.Skip); err != nil {
+			if err := filestore.AppendLogsAsync(t.Context(), ch, w, cursor.Skip, false); err != nil {
 				t.Fatalf("AppendLogsAsync() error = %v", err)
 			}
 
@@ -669,7 +669,7 @@ func TestCopyResumeRoundTrip(t *testing.T) {
 			w := appendWriter(t, output, cursor)
 			replay := []types.Log{testLog(102, 0), testLog(102, 1), boundaryHigher}
 			replay = append(replay, newer...)
-			if err := filestore.AppendLogsAsync(t.Context(), feed(replay...), w, cursor.Skip); err != nil {
+			if err := filestore.AppendLogsAsync(t.Context(), feed(replay...), w, cursor.Skip, false); err != nil {
 				t.Fatalf("AppendLogsAsync() error = %v", err)
 			}
 
@@ -760,7 +760,7 @@ func TestCopyResumeFromInterruptedInput(t *testing.T) {
 
 			w := appendWriter(t, output, cursor)
 			replay := []types.Log{testLog(101, 0), testLog(102, 0), testLog(103, 0)}
-			if err := filestore.AppendLogsAsync(t.Context(), feed(replay...), w, cursor.Skip); err != nil {
+			if err := filestore.AppendLogsAsync(t.Context(), feed(replay...), w, cursor.Skip, false); err != nil {
 				t.Fatalf("AppendLogsAsync() error = %v", err)
 			}
 
@@ -1009,7 +1009,7 @@ func TestResumeAfterInterruptedWrite(t *testing.T) {
 				t.Errorf("discarded = %d, want %d", discarded, want)
 			}
 
-			if err := filestore.AppendLogsAsync(t.Context(), feed(tt.replay...), appendWriter(t, path, cursor), cursor.Skip); err != nil {
+			if err := filestore.AppendLogsAsync(t.Context(), feed(tt.replay...), appendWriter(t, path, cursor), cursor.Skip, false); err != nil {
 				t.Fatalf("AppendLogsAsync() error = %v", err)
 			}
 
@@ -1136,7 +1136,7 @@ func TestResumeMultipleEmptyAppends(t *testing.T) {
 			if _, err := resume.PrepareOutput(cursor, path, path); err != nil {
 				t.Fatalf("first PrepareOutput() error = %v", err)
 			}
-			if err := filestore.AppendLogsAsync(t.Context(), feed(), appendWriter(t, path, cursor), cursor.Skip); err != nil {
+			if err := filestore.AppendLogsAsync(t.Context(), feed(), appendWriter(t, path, cursor), cursor.Skip, false); err != nil {
 				t.Fatalf("first AppendLogsAsync() error = %v", err)
 			}
 
@@ -1148,7 +1148,7 @@ func TestResumeMultipleEmptyAppends(t *testing.T) {
 			if _, err := resume.PrepareOutput(cursor, path, path); err != nil {
 				t.Fatalf("second PrepareOutput() error = %v", err)
 			}
-			if err := filestore.AppendLogsAsync(t.Context(), feed(), appendWriter(t, path, cursor), cursor.Skip); err != nil {
+			if err := filestore.AppendLogsAsync(t.Context(), feed(), appendWriter(t, path, cursor), cursor.Skip, false); err != nil {
 				t.Fatalf("second AppendLogsAsync() error = %v", err)
 			}
 
@@ -1161,7 +1161,7 @@ func TestResumeMultipleEmptyAppends(t *testing.T) {
 			if _, err := resume.PrepareOutput(cursor, path, path); err != nil {
 				t.Fatalf("third PrepareOutput() error = %v", err)
 			}
-			if err := filestore.AppendLogsAsync(t.Context(), feed(newLogs...), appendWriter(t, path, cursor), cursor.Skip); err != nil {
+			if err := filestore.AppendLogsAsync(t.Context(), feed(newLogs...), appendWriter(t, path, cursor), cursor.Skip, false); err != nil {
 				t.Fatalf("third AppendLogsAsync() error = %v", err)
 			}
 

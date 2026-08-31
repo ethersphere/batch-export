@@ -12,6 +12,7 @@ batch-export is a tool to retrieve Ethereum event logs for specific contracts, p
 - Exports up to the latest **finalized** block by default (`--end=0`), so a snapshot never contains logs from blocks that can still be reorged.
 - Graceful shutdown on interrupt signals (Ctrl+C).
 - Continue a previous export from where it stopped (incremental snapshots).
+- By default emits a slim log shape — only the `types.Log` fields Bee consumes (`address`, `topics`, `data`, `blockNumber`, `transactionHash`), plus `logIndex` so exports stay resumable. Pass `--slim=false` to emit the full geth `types.Log` JSON shape for other consumers. The slim shape is decoder-compatible with geth's `types.Log` (so Bee reads both interchangeably).
 
 ## Requirements
 
@@ -55,6 +56,7 @@ The primary command is export.
   -r, --resume string              Continue a previous export file (.ndjson, .gz or .gzip); combine with --output to write a new snapshot instead of appending in place
       --retry-delay duration       Delay before the first retry, doubling per retry up to 30s (default 1s)
       --retry-max int              Max retries per RPC request on transient network errors (0 disables retrying) (default 5)
+      --slim                       Emit only the types.Log fields Bee consumes, plus logIndex (default true)
       --start uint                 Start block (optional, uses contract start block if 0) (default 31306381)
   -v, --verbosity string           Log verbosity (silent, error, warn, info, debug) (default "info")
 ```
