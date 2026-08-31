@@ -102,9 +102,9 @@ jobs:
             fi
             archive_tag="${ARCHIVE_TAG_INPUT}"
           else
-            archive_tag="$(git tag --sort=-v:refname | head -n 1)"
+            archive_tag="$(git tag | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
             if [ -z "${archive_tag}" ]; then
-              echo "::error::batch-archive has no tags to resume from"
+              echo "::error::batch-archive has no semver tag (vX.Y.Z) to resume from"
               exit 1
             fi
           fi
@@ -139,18 +139,26 @@ jobs:
           echo "::add-mask::${endpoint}"
           echo "RPC_ENDPOINT=${endpoint}" >> "${GITHUB_ENV}"
 
+      # Inputs are routed through env rather than interpolated into the script:
+      # a `${{ inputs.* }}` inside `run` is substituted before bash parses it,
+      # which lets a crafted input inject shell on the runner.
       - name: Export
+        env:
+          END_BLOCK: ${{ inputs.end_block }}
+          MAX_REQUEST: ${{ inputs.max_request }}
+          BLOCK_RANGE_LIMIT: ${{ inputs.block_range_limit }}
+          VERBOSITY: ${{ inputs.verbosity }}
         run: |
           set -euo pipefail
           ./dist/batch-export export \
             --endpoint "${RPC_ENDPOINT}" \
             --resume resume.ndjson.gzip \
             --output snapshot.ndjson.gzip \
-            --end "${{ inputs.end_block }}" \
-            --max-request "${{ inputs.max_request }}" \
-            --block-range-limit "${{ inputs.block_range_limit }}" \
+            --end "${END_BLOCK}" \
+            --max-request "${MAX_REQUEST}" \
+            --block-range-limit "${BLOCK_RANGE_LIMIT}" \
             --slim=true \
-            --verbosity "${{ inputs.verbosity }}"
+            --verbosity "${VERBOSITY}"
 
       - name: Publish to batch-archive
         run: |
@@ -173,9 +181,15 @@ jobs:
           fi
           last_block="$(printf '%d' "${last_block_hex}")"
 
-          # Bump the patch of the highest existing tag, not of the resume tag,
-          # so resuming an older tag can never collide with an existing tag.
-          latest_tag="$(git tag --sort=-v:refname | head -n 1)"
+          # Bump the patch of the highest existing semver tag, not of the
+          # resume tag, so resuming an older tag can never collide with an
+          # existing tag. Non-semver tags (pre-releases included) are ignored
+          # rather than parsed into a malformed bump.
+          latest_tag="$(git tag | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+          if [ -z "${latest_tag}" ]; then
+            echo "::error::batch-archive has no semver tag (vX.Y.Z) to bump"
+            exit 1
+          fi
           IFS=. read -r major minor patch <<< "${latest_tag#v}"
           new_tag="v${major}.${minor}.$((patch + 1))"
 
@@ -184,5 +198,8 @@ jobs:
           git add archive/export.ndjson.gzip
           git commit -m "chore: update snapshot to block number ${last_block}"
           git tag "${new_tag}"
-          git push origin HEAD:main "refs/tags/${new_tag}"
+          # --atomic: if main was pushed to during the run, reject the commit
+          # AND the tag together — a lone orphaned tag would become the next
+          # run's resume point and clobber main's newer content.
+          git push --atomic origin HEAD:main "refs/tags/${new_tag}"
           echo "::notice::published snapshot at block ${last_block} as ${new_tag} (resumed from ${ARCHIVE_TAG})"
