@@ -1,24 +1,32 @@
 name: Batch Sync
 
-# Skeleton. The export step below is wired and runnable; the "sync" step that
-# publishes the artifact is intentionally left as a TODO — fill it in once the
-# destination is decided.
+# Resumes the postage-batch snapshot kept in ethersphere/batch-archive and
+# publishes the refreshed file back there: commit on main plus a new patch tag
+# (vX.Y.Z -> vX.Y.Z+1). The resume point is a batch-archive tag — an input, or
+# the latest semver tag when left empty.
+#
+# The snapshot is a gzipped NDJSON file; resuming a compressed file yields a
+# compressed result, and --start is dictated by the resume cursor, which is why
+# neither is an input here.
 #
 # Runner: the self-hosted `bee` runners are inside the RPC's network allowlist,
 # so they reach the endpoint without credentials. If this is ever moved to a
 # GitHub-hosted runner, the endpoint requires HTTP Basic auth — see the
 # "Compose endpoint" step.
+#
+# Secrets: GHA_PAT_BASIC must have contents:write on ethersphere/batch-archive
+# — it authenticates the checkout and the push of the commit and tag.
 
 on:
   workflow_dispatch:
     inputs:
-      start_block:
-        description: "Start block (0 = contract start block)"
-        required: true
-        default: "31306381"
+      archive_tag:
+        description: "batch-archive tag to resume from (empty = latest)"
+        required: false
+        default: ""
         type: string
       end_block:
-        description: "End block (0 = latest)"
+        description: "End block (0 = latest finalized)"
         required: true
         default: "0"
         type: string
@@ -32,16 +40,6 @@ on:
         required: true
         default: "5"
         type: string
-      output:
-        description: "Output file path (NDJSON)"
-        required: true
-        default: "export.ndjson"
-        type: string
-      compress:
-        description: "Compress output to GZIP"
-        required: true
-        default: false
-        type: boolean
       verbosity:
         description: "Log verbosity"
         required: true
@@ -49,7 +47,7 @@ on:
         type: choice
         options: [silent, error, warn, info, debug]
 
-  # Uncomment to run on a schedule once the sync destination is wired up.
+  # Uncomment to refresh the snapshot on a schedule.
   # schedule:
   #   - cron: "0 3 * * *"
 
@@ -80,6 +78,39 @@ jobs:
       # `make build` only runs `go build ./...` and produces no artifact.
       - name: Build
         run: make binary
+
+      # Full history and tags: the latest tag is resolved locally, and the
+      # snapshot is read at the resolved tag rather than at main's HEAD.
+      - name: Checkout batch-archive
+        uses: actions/checkout@v5
+        with:
+          repository: ethersphere/batch-archive
+          token: ${{ secrets.GHA_PAT_BASIC }}
+          path: batch-archive
+          fetch-depth: 0
+
+      - name: Resolve resume point
+        env:
+          ARCHIVE_TAG_INPUT: ${{ inputs.archive_tag }}
+        run: |
+          set -euo pipefail
+          cd batch-archive
+          if [ -n "${ARCHIVE_TAG_INPUT}" ]; then
+            if ! git rev-parse -q --verify "refs/tags/${ARCHIVE_TAG_INPUT}" >/dev/null; then
+              echo "::error::tag '${ARCHIVE_TAG_INPUT}' does not exist in batch-archive"
+              exit 1
+            fi
+            archive_tag="${ARCHIVE_TAG_INPUT}"
+          else
+            archive_tag="$(git tag --sort=-v:refname | head -n 1)"
+            if [ -z "${archive_tag}" ]; then
+              echo "::error::batch-archive has no tags to resume from"
+              exit 1
+            fi
+          fi
+          echo "resuming from batch-archive tag ${archive_tag}"
+          git show "${archive_tag}:archive/export.ndjson.gzip" > ../resume.ndjson.gzip
+          echo "ARCHIVE_TAG=${archive_tag}" >> "${GITHUB_ENV}"
 
       # The bare URL works from the self-hosted runners because their egress IPs
       # are allowlisted. USER/PASSWORD are only needed off-allowlist; when they
@@ -113,15 +144,45 @@ jobs:
           set -euo pipefail
           ./dist/batch-export export \
             --endpoint "${RPC_ENDPOINT}" \
-            --start "${{ inputs.start_block }}" \
+            --resume resume.ndjson.gzip \
+            --output snapshot.ndjson.gzip \
             --end "${{ inputs.end_block }}" \
             --max-request "${{ inputs.max_request }}" \
             --block-range-limit "${{ inputs.block_range_limit }}" \
-            --output "${{ inputs.output }}" \
-            --verbosity "${{ inputs.verbosity }}" \
-            ${{ inputs.compress && '--compress' || '' }}
+            --slim=true \
+            --verbosity "${{ inputs.verbosity }}"
 
-      - name: Sync
+      - name: Publish to batch-archive
         run: |
-          echo "TODO: publish ${{ inputs.output }} to its destination."
-          exit 1
+          set -euo pipefail
+          cp snapshot.ndjson.gzip batch-archive/archive/export.ndjson.gzip
+          cd batch-archive
+
+          if git diff --quiet; then
+            echo "::notice::snapshot is unchanged; nothing to publish"
+            exit 0
+          fi
+
+          # blockNumber is hex ("0x...") in the slim NDJSON; the commit title
+          # uses decimal, matching the archive's history.
+          last_block_hex="$(gunzip -c archive/export.ndjson.gzip | tail -n 1 \
+            | sed -nE 's/.*"blockNumber":"(0x[0-9a-fA-F]+)".*/\1/p')"
+          if [ -z "${last_block_hex}" ]; then
+            echo "::error::could not read blockNumber from the last snapshot entry"
+            exit 1
+          fi
+          last_block="$(printf '%d' "${last_block_hex}")"
+
+          # Bump the patch of the highest existing tag, not of the resume tag,
+          # so resuming an older tag can never collide with an existing tag.
+          latest_tag="$(git tag --sort=-v:refname | head -n 1)"
+          IFS=. read -r major minor patch <<< "${latest_tag#v}"
+          new_tag="v${major}.${minor}.$((patch + 1))"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898470+github-actions[bot]@users.noreply.github.com"
+          git add archive/export.ndjson.gzip
+          git commit -m "chore: update snapshot to block number ${last_block}"
+          git tag "${new_tag}"
+          git push origin HEAD:main "refs/tags/${new_tag}"
+          echo "::notice::published snapshot at block ${last_block} as ${new_tag} (resumed from ${ARCHIVE_TAG})"
