@@ -16,10 +16,9 @@ func (c *command) initVerifyCmd() error {
 	cmd := &cobra.Command{
 		Use:   "verify",
 		Short: "Verify that a refreshed snapshot extends the one it was resumed from",
-		Long: `Verifies that the snapshot at --new holds everything the snapshot at --old does,
-byte for byte and in order, followed only by newer entries. On success the new
-snapshot's last block number is printed to stdout in decimal; any failure exits
-non-zero with nothing on stdout.`,
+		Long: `Verifies that --new begins with the entire content of --old, byte for byte,
+and that every entry after it is strictly newer. Prints the new snapshot's last
+block number in decimal on stdout; any failure exits non-zero with empty stdout.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			result, err := verify.Verify(oldFile, newFile)
 			if err != nil {
