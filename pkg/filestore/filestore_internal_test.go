@@ -22,7 +22,7 @@ func TestSaveLogsReportsCloseError(t *testing.T) {
 	logChan <- types.Log{BlockNumber: 1}
 	close(logChan)
 
-	err := saveLogs(context.Background(), logChan, &closeFailWriter{closeErr: closeErr})
+	err := saveLogs(context.Background(), logChan, &closeFailWriter{closeErr: closeErr}, false)
 	if !errors.Is(err, closeErr) {
 		t.Fatalf("got %v, want close error %v", err, closeErr)
 	}
@@ -34,7 +34,7 @@ func TestSaveLogsKeepsContextErrorOnCloseFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := saveLogs(ctx, make(chan types.Log), &closeFailWriter{closeErr: closeErr})
+	err := saveLogs(ctx, make(chan types.Log), &closeFailWriter{closeErr: closeErr}, false)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v, want context.Canceled", err)
 	}
