@@ -10,10 +10,14 @@ The Batch Sync workflow resumes the postage-batch snapshot from a tag of
 [ethersphere/batch-archive](https://github.com/ethersphere/batch-archive) and
 publishes the refreshed file back as a commit on `main` plus the next patch
 tag. Nothing verifies that the refreshed snapshot is a strict extension of the
-one it resumed from. A regression in batch-export — in the resume logic, the
-slim NDJSON encoding, or the gzip append handling — could silently drop,
-mutate, or reorder historical entries, and the workflow would tag and publish
-the corrupted snapshot as the new latest version.
+one it resumed from. A regression in batch-export — in the resume logic or the
+gzip append handling — could silently drop, mutate, or reorder historical
+entries, and the workflow would tag and publish the corrupted snapshot as the
+new latest version. (The gate does not catch a regression confined to the
+slim NDJSON encoding itself: `ParseEntry` only requires `blockNumber` and
+`logIndex`, so an appended entry written in the full geth shape still
+verifies clean. The encoding is pinned separately, by `pkg/filestore`'s own
+tests.)
 
 Separately, the workflow extracts the last block number for the commit title
 with a `gunzip | tail | sed` pipeline whose regex re-encodes the slim JSON

@@ -40,6 +40,6 @@ clean:
 
 .PHONY: test
 test:
-	$(GO) test -v ./pkg/...
+	$(GO) test -v ./...
 
 FORCE:
