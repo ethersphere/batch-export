@@ -34,9 +34,8 @@ type Result struct {
 	LastBlock uint64
 	// Appended is how many entries the new snapshot adds.
 	Appended int
-	// OldTruncated reports whether the old snapshot carried an interrupted
-	// tail, excluded from the comparison the way resuming excludes it from
-	// the copy.
+	// OldTruncated reports whether the old snapshot's interrupted tail was
+	// excluded from the comparison.
 	OldTruncated bool
 }
 
@@ -54,13 +53,13 @@ func Verify(oldPath, newPath string) (Result, error) {
 		return Result{}, ErrTruncatedNew
 	}
 
-	oldClean, err := resume.OpenClean(oldPath, oldCursor)
+	oldClean, err := oldCursor.OpenClean(oldPath)
 	if err != nil {
 		return Result{}, fmt.Errorf("old snapshot: %w", err)
 	}
 	defer oldClean.Close()
 
-	newClean, err := resume.OpenClean(newPath, newCursor)
+	newClean, err := newCursor.OpenClean(newPath)
 	if err != nil {
 		return Result{}, fmt.Errorf("new snapshot: %w", err)
 	}
@@ -121,30 +120,17 @@ func checkTail(r *bufio.Reader, prev *resume.Cursor) (int, error) {
 	last := *prev
 
 	var (
-		appended int
-		lineNum  int
-		line     []byte
+		lineNum int
+		line    []byte
 	)
 	for {
-		chunk, err := r.ReadSlice('\n')
-		line = append(line, chunk...)
-		if len(line) > resume.MaxLineBytes {
-			return 0, fmt.Errorf("appended line %d exceeds %d bytes", lineNum+1, resume.MaxLineBytes)
-		}
-
+		var err error
+		line, err = resume.ReadLine(line[:0], r)
 		switch {
-		case errors.Is(err, bufio.ErrBufferFull):
-			continue
 		case errors.Is(err, io.EOF):
-			// Defensive: Verify rejects a truncated new file up front, and a
-			// clean gzip member ending mid-line is already refused by
-			// resume.Read, so this should be unreachable in practice.
-			if len(line) > 0 {
-				return 0, fmt.Errorf("appended line %d ends without a newline", lineNum+1)
-			}
-			return appended, nil
+			return lineNum, nil
 		case err != nil:
-			return 0, fmt.Errorf("error reading new snapshot: %w", err)
+			return 0, fmt.Errorf("appended line %d: %w", lineNum+1, err)
 		}
 
 		lineNum++
@@ -152,20 +138,10 @@ func checkTail(r *bufio.Reader, prev *resume.Cursor) (int, error) {
 		if err != nil {
 			return 0, fmt.Errorf("appended line %d is not a log entry: %w", lineNum, err)
 		}
-		if !after(entry, &last) {
+		if !last.Before(entry.BlockNumber, entry.LogIndex) {
 			return 0, fmt.Errorf("%w: appended line %d holds (block %d, log %d) after (block %d, log %d)",
 				ErrOrder, lineNum, entry.BlockNumber, entry.LogIndex, last.BlockNumber, last.LogIndex)
 		}
 		last = *entry
-		appended++
-		line = line[:0]
 	}
-}
-
-// after reports whether entry strictly follows prev in log order.
-func after(entry, prev *resume.Cursor) bool {
-	if entry.BlockNumber != prev.BlockNumber {
-		return entry.BlockNumber > prev.BlockNumber
-	}
-	return entry.LogIndex > prev.LogIndex
 }

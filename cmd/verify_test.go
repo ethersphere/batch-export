@@ -41,43 +41,52 @@ func writeSnapshot(t *testing.T, name string, entries ...[2]uint64) string {
 func TestVerifyCmd(t *testing.T) {
 	t.Parallel()
 
-	oldPath := writeSnapshot(t, "old.ndjson.gzip", [2]uint64{1, 0}, [2]uint64{2, 0})
-	newPath := writeSnapshot(t, "new.ndjson.gzip", [2]uint64{1, 0}, [2]uint64{2, 0}, [2]uint64{3, 0})
-
-	c, err := newCommand()
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name    string
+		old     [][2]uint64
+		new     [][2]uint64
+		wantErr bool
+		wantOut string
+	}{
+		{
+			name:    "extension prints the last block",
+			old:     [][2]uint64{{1, 0}, {2, 0}},
+			new:     [][2]uint64{{1, 0}, {2, 0}, {3, 0}},
+			wantOut: "3\n",
+		},
+		{
+			name:    "a dropped entry is refused with empty stdout",
+			old:     [][2]uint64{{1, 0}, {2, 0}},
+			new:     [][2]uint64{{1, 0}, {3, 0}},
+			wantErr: true,
+		},
 	}
-	var out bytes.Buffer
-	c.root.SetOut(&out)
-	c.root.SetArgs([]string{"verify", "--old", oldPath, "--new", newPath})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	if err := c.Execute(context.Background()); err != nil {
-		t.Fatalf("verify: %v", err)
-	}
-	if got, want := out.String(), "3\n"; got != want {
-		t.Errorf("stdout = %q, want %q", got, want)
-	}
-}
+			c, err := newCommand()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			c.root.SetOut(&out)
+			c.root.SetArgs([]string{
+				"verify",
+				"--old", writeSnapshot(t, "old.ndjson.gzip", tc.old...),
+				"--new", writeSnapshot(t, "new.ndjson.gzip", tc.new...),
+			})
 
-func TestVerifyCmdRefusal(t *testing.T) {
-	t.Parallel()
-
-	oldPath := writeSnapshot(t, "old.ndjson.gzip", [2]uint64{1, 0}, [2]uint64{2, 0})
-	newPath := writeSnapshot(t, "new.ndjson.gzip", [2]uint64{1, 0}, [2]uint64{3, 0})
-
-	c, err := newCommand()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out bytes.Buffer
-	c.root.SetOut(&out)
-	c.root.SetArgs([]string{"verify", "--old", oldPath, "--new", newPath})
-
-	if err := c.Execute(context.Background()); err == nil {
-		t.Fatal("want an error for a snapshot that drops an entry")
-	}
-	if out.Len() != 0 {
-		t.Errorf("stdout = %q, want empty", out.String())
+			err = c.Execute(context.Background())
+			if tc.wantErr && err == nil {
+				t.Fatal("verify: want an error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("verify: %v", err)
+			}
+			if got := out.String(); got != tc.wantOut {
+				t.Errorf("stdout = %q, want %q", got, tc.wantOut)
+			}
+		})
 	}
 }

@@ -1298,7 +1298,7 @@ func TestOpenClean(t *testing.T) {
 				t.Fatalf("Read: %v", err)
 			}
 
-			r, err := resume.OpenClean(path, cursor)
+			r, err := cursor.OpenClean(path)
 			if err != nil {
 				t.Fatalf("OpenClean: %v", err)
 			}
