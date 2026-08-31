@@ -40,9 +40,6 @@ failed verification blocks the commit and the tag.
 
 - No chain-side validation: `verify` never queries an RPC endpoint.
 - No repair: a bad snapshot is reported, never fixed.
-- No comparison against batch-archive `main`'s current file: the contract is
-  old-input vs. new-output of one export run. (The workflow always resumes
-  the file it just fetched, so that is the meaningful pair.)
 - No change to export behavior, scheduling, or bootstrap flows.
 
 ## CLI contract
@@ -51,8 +48,10 @@ failed verification blocks the commit and the tag.
 batch-export verify --old <file> --new <file> [--verbosity <level>]
 ```
 
-- `--old` (required): the snapshot the export resumed from — in the workflow,
-  the file fetched from the batch-archive tag.
+- `--old` (required): the snapshot the new one must extend — in the workflow,
+  the archive file the publish step overwrites, which is what a regression
+  would actually destroy. That is the same file the export resumed from
+  whenever the resumed tag is main's tip, and a stricter check when it is not.
 - `--new` (required): the freshly exported snapshot.
 - Formats: plain NDJSON or gzip, each file detected independently by content
   (the same detection `--resume` uses); any old/new combination is accepted.
@@ -115,9 +114,15 @@ the minimal piece is exported from there rather than duplicated.
       - name: Verify snapshot
         run: |
           set -euo pipefail
-          last_block="$(./dist/batch-export verify --old resume.ndjson.gzip --new snapshot.ndjson.gzip)"
+          last_block="$(./dist/batch-export verify \
+            --old batch-archive/archive/export.ndjson.gzip \
+            --new snapshot.ndjson.gzip)"
           echo "LAST_BLOCK=${last_block}" >> "${GITHUB_ENV}"
 ```
+
+`--old` is the archive's current file rather than the resumed tag's: the
+publish step overwrites it, so it is what a regression would destroy. The
+two are the same bytes whenever the resumed tag is main's tip.
 
 The Publish step then uses `${LAST_BLOCK}` in the commit title and drops the
 `gunzip | tail | sed` block together with its empty-result guard. A verify

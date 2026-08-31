@@ -933,6 +933,11 @@ In `.github/workflows/batch-sync.yml`, insert between the `Export` and `Publish 
           echo "LAST_BLOCK=${last_block}" >> "${GITHUB_ENV}"
 ```
 
+> Superseded during the final review: `--old` ships as
+> `batch-archive/archive/export.ndjson.gzip`, the file the publish step
+> overwrites, because a non-tip `archive_tag` makes the resumed file and the
+> replaced file diverge. See the spec's CLI contract.
+
 - [ ] **Step 2: Replace the sed extraction in the Publish step**
 
 Delete this block from `Publish to batch-archive`:
