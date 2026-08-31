@@ -5,8 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -114,49 +117,214 @@ func TestSlimRoundTripsThroughGethDecoder(t *testing.T) {
 	}
 }
 
-func TestSaveLogsAsyncWritesNDJSON(t *testing.T) {
+// TestAppendLogsAsyncWritesSlimShape covers the slim path end to end: a log
+// written with slim enabled lands in the file holding only the kept keys.
+func TestAppendLogsAsyncWritesSlimShape(t *testing.T) {
+	t.Parallel()
+
 	path := filepath.Join(t.TempDir(), "export.ndjson")
 
-	logChan := make(chan types.Log, 2)
-	for i := uint64(1); i <= 2; i++ {
-		logChan <- types.Log{
-			Address:     common.HexToAddress("0x000000000000000000000000000000000000bEEF"),
-			Topics:      []common.Hash{common.HexToHash("0x11")},
-			Data:        []byte{0xde, 0xad},
-			BlockNumber: i,
+	ch := make(chan types.Log, 1)
+	ch <- sampleLog()
+	close(ch)
+
+	w, err := filestore.CreateWriter(path)
+	if err != nil {
+		t.Fatalf("CreateWriter() error = %v", err)
+	}
+	if err := filestore.AppendLogsAsync(t.Context(), ch, w, nil, true); err != nil {
+		t.Fatalf("AppendLogsAsync() error = %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(bytes.TrimSpace(data), &got); err != nil {
+		t.Fatalf("unmarshal %q: %v", data, err)
+	}
+
+	kept := []string{"address", "topics", "data", "blockNumber", "transactionHash", "logIndex"}
+	for _, k := range kept {
+		if _, ok := got[k]; !ok {
+			t.Errorf("slim output is missing key %q", k)
 		}
 	}
-	close(logChan)
-
-	if err := filestore.SaveLogsAsync(context.Background(), logChan, path, false); err != nil {
-		t.Fatalf("SaveLogsAsync: %v", err)
+	if len(got) != len(kept) {
+		t.Errorf("slim output has %d keys, want %d: %s", len(got), len(kept), data)
 	}
+}
+
+// blocksIn returns the block number of every log line in the file at path.
+func blocksIn(t *testing.T, path string) []uint64 {
+	t.Helper()
 
 	file, err := os.Open(path)
 	if err != nil {
-		t.Fatalf("open output: %v", err)
+		t.Fatalf("open %s: %v", path, err)
 	}
 	defer file.Close()
 
-	var got []types.Log
+	var blocks []uint64
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) == "" {
+			continue
+		}
 		var l types.Log
 		if err := json.Unmarshal(scanner.Bytes(), &l); err != nil {
-			t.Fatalf("decode line %d: %v", len(got)+1, err)
+			t.Fatalf("unmarshal %q: %v", scanner.Text(), err)
 		}
-		got = append(got, l)
+		blocks = append(blocks, l.BlockNumber)
 	}
 	if err := scanner.Err(); err != nil {
-		t.Fatalf("scan output: %v", err)
+		t.Fatalf("scan %s: %v", path, err)
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("got %d logs, want 2", len(got))
+	return blocks
+}
+
+// seed writes logs for the given blocks to a fresh file at path.
+func seed(t *testing.T, path string, blocks ...uint64) {
+	t.Helper()
+
+	w, err := filestore.CreateWriter(path)
+	if err != nil {
+		t.Fatalf("CreateWriter() error = %v", err)
 	}
-	for i, l := range got {
-		if l.BlockNumber != uint64(i+1) {
-			t.Errorf("log %d: blockNumber got %d want %d", i, l.BlockNumber, i+1)
-		}
+	if err := filestore.AppendLogsAsync(t.Context(), feed(blocks...), w, nil, false); err != nil {
+		t.Fatalf("AppendLogsAsync() error = %v", err)
+	}
+}
+
+// feed returns a closed channel already holding logs for the given blocks.
+// Topics must stay a non-nil empty slice: go-ethereum's generated
+// Log.UnmarshalJSON rejects a null "topics" as a missing required field.
+func feed(blocks ...uint64) <-chan types.Log {
+	ch := make(chan types.Log, len(blocks))
+	for _, b := range blocks {
+		ch <- types.Log{BlockNumber: b, Topics: []common.Hash{}}
+	}
+	close(ch)
+
+	return ch
+}
+
+func TestCreateWriterReplacesExistingFile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "export.ndjson")
+	if err := os.WriteFile(path, []byte("stale\n"), 0o644); err != nil {
+		t.Fatalf("seed %s: %v", path, err)
+	}
+
+	seed(t, path, 1, 2)
+
+	want := []uint64{1, 2}
+	if got := blocksIn(t, path); !slices.Equal(got, want) {
+		t.Errorf("blocks = %v, want %v", got, want)
+	}
+}
+
+func TestAppendLogsAsyncKeepsExistingContent(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "export.ndjson")
+	seed(t, path, 1, 2)
+
+	w, err := filestore.AppendWriter(path)
+	if err != nil {
+		t.Fatalf("AppendWriter() error = %v", err)
+	}
+	if err := filestore.AppendLogsAsync(t.Context(), feed(3, 4), w, nil, false); err != nil {
+		t.Fatalf("AppendLogsAsync() error = %v", err)
+	}
+
+	want := []uint64{1, 2, 3, 4}
+	if got := blocksIn(t, path); !slices.Equal(got, want) {
+		t.Errorf("blocks = %v, want %v", got, want)
+	}
+}
+
+func TestAppendLogsAsyncSkipsFilteredLogs(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "export.ndjson")
+	seed(t, path, 1, 2)
+
+	w, err := filestore.AppendWriter(path)
+	if err != nil {
+		t.Fatalf("AppendWriter() error = %v", err)
+	}
+	skip := func(l types.Log) bool { return l.BlockNumber <= 2 }
+	if err := filestore.AppendLogsAsync(t.Context(), feed(1, 2, 3, 4), w, skip, false); err != nil {
+		t.Fatalf("AppendLogsAsync() error = %v", err)
+	}
+
+	want := []uint64{1, 2, 3, 4}
+	if got := blocksIn(t, path); !slices.Equal(got, want) {
+		t.Errorf("blocks = %v, want %v", got, want)
+	}
+}
+
+func TestAppendLogsAsyncClosesWriterOnCancel(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "export.ndjson")
+	seed(t, path, 1)
+
+	w, err := filestore.AppendWriter(path)
+	if err != nil {
+		t.Fatalf("AppendWriter() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	// An open channel that never delivers, so cancellation is the only exit.
+	if err := filestore.AppendLogsAsync(ctx, make(chan types.Log), w, nil, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("AppendLogsAsync() error = %v, want context.Canceled", err)
+	}
+
+	// The writer must already be closed; closing it again must fail.
+	if err := w.Close(); err == nil {
+		t.Error("writer was left open after cancellation")
+	}
+}
+
+// closeFailWriter accepts all writes but fails on Close, mimicking a file
+// whose OS-buffered data cannot be flushed (disk full, quota, network fs).
+type closeFailWriter struct{ closeErr error }
+
+func (w *closeFailWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *closeFailWriter) Close() error                { return w.closeErr }
+
+func TestAppendLogsAsyncReportsCloseError(t *testing.T) {
+	t.Parallel()
+
+	closeErr := errors.New("flush to disk failed")
+
+	err := filestore.AppendLogsAsync(t.Context(), feed(1), &closeFailWriter{closeErr: closeErr}, nil, false)
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("AppendLogsAsync() error = %v, want close error %v", err, closeErr)
+	}
+}
+
+func TestAppendLogsAsyncKeepsContextErrorOnCloseFailure(t *testing.T) {
+	t.Parallel()
+
+	closeErr := errors.New("flush to disk failed")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := filestore.AppendLogsAsync(ctx, make(chan types.Log), &closeFailWriter{closeErr: closeErr}, nil, false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("AppendLogsAsync() error = %v, want context.Canceled", err)
+	}
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("AppendLogsAsync() error = %v, want close error %v", err, closeErr)
 	}
 }

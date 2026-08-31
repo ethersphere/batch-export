@@ -38,27 +38,48 @@ func NewSlimLog(l types.Log) SlimLog {
 	}
 }
 
-// SaveLogsAsync writes logs to a file asynchronously.
-// When slim is true, each log is encoded with only the fields Bee consumes;
-// otherwise the full geth types.Log JSON shape is emitted.
-func SaveLogsAsync(ctx context.Context, logChan <-chan types.Log, filePath string, slim bool) error {
+// CreateWriter creates the file at filePath, replacing anything already there.
+// It is separate from writing so a caller can fail before it starts producing
+// logs it would have nowhere to put.
+func CreateWriter(filePath string) (io.WriteCloser, error) {
 	file, err := os.Create(filePath)
 	if err != nil {
-		return fmt.Errorf("error creating file: %w", err)
+		return nil, fmt.Errorf("error creating file: %w", err)
 	}
-	return saveLogs(ctx, logChan, file, slim)
+
+	return file, nil
 }
 
-func saveLogs(ctx context.Context, logChan <-chan types.Log, w io.WriteCloser, slim bool) (err error) {
-	// OS-buffered writes can surface a failure only when the file is flushed
-	// at close time, so a swallowed Close error would report an incomplete
-	// export as success.
-	defer func() {
-		if cerr := w.Close(); cerr != nil {
-			err = errors.Join(err, fmt.Errorf("error closing file: %w", cerr))
-		}
-	}()
+// AppendWriter opens an existing NDJSON file for appending.
+func AppendWriter(filePath string) (io.WriteCloser, error) {
+	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("error opening file for appending: %w", err)
+	}
 
+	return file, nil
+}
+
+// AppendLogsAsync writes logs to w asynchronously, keeping whatever the
+// destination already holds. Logs for which skip reports true are dropped; a
+// nil skip writes every log. When slim is true, each log is encoded with only
+// the fields Bee consumes; otherwise the full geth types.Log JSON shape is
+// emitted. w is closed before returning, cancellation included, so a buffered
+// destination is always flushed.
+//
+// The close error is joined rather than discarded: on a compressed destination
+// Close writes the terminator and footer, so a failure there leaves a truncated
+// member that must not be reported as a completed save. errors.Join keeps
+// errors.Is working, so a cancelled context still reads as context.Canceled.
+func AppendLogsAsync(ctx context.Context, logChan <-chan types.Log, w io.WriteCloser, skip func(types.Log) bool, slim bool) (err error) {
+	defer func() { err = errors.Join(err, w.Close()) }()
+
+	return writeLogs(ctx, logChan, w, skip, slim)
+}
+
+// writeLogs encodes logs from logChan to w as NDJSON until the channel is
+// closed or the context is cancelled.
+func writeLogs(ctx context.Context, logChan <-chan types.Log, w io.Writer, skip func(types.Log) bool, slim bool) error {
 	encoder := json.NewEncoder(w)
 
 	encode := func(l types.Log) error { return encoder.Encode(l) }
@@ -73,6 +94,10 @@ func saveLogs(ctx context.Context, logChan <-chan types.Log, w io.WriteCloser, s
 		case logObj, ok := <-logChan:
 			if !ok {
 				return nil
+			}
+
+			if skip != nil && skip(logObj) {
+				continue
 			}
 
 			if err := encode(logObj); err != nil {
