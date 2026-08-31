@@ -1,0 +1,127 @@
+name: Batch Sync
+
+# Skeleton. The export step below is wired and runnable; the "sync" step that
+# publishes the artifact is intentionally left as a TODO — fill it in once the
+# destination is decided.
+#
+# Runner: the self-hosted `bee` runners are inside the RPC's network allowlist,
+# so they reach the endpoint without credentials. If this is ever moved to a
+# GitHub-hosted runner, the endpoint requires HTTP Basic auth — see the
+# "Compose endpoint" step.
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_block:
+        description: "Start block (0 = contract start block)"
+        required: true
+        default: "31306381"
+        type: string
+      end_block:
+        description: "End block (0 = latest)"
+        required: true
+        default: "0"
+        type: string
+      max_request:
+        description: "Max RPC requests per second"
+        required: true
+        default: "15"
+        type: string
+      block_range_limit:
+        description: "Max blocks per eth_getLogs query (keep low; large ranges can OOM the node)"
+        required: true
+        default: "5"
+        type: string
+      output:
+        description: "Output file path (NDJSON)"
+        required: true
+        default: "export.ndjson"
+        type: string
+      compress:
+        description: "Compress output to GZIP"
+        required: true
+        default: false
+        type: boolean
+      verbosity:
+        description: "Log verbosity"
+        required: true
+        default: "info"
+        type: choice
+        options: [silent, error, warn, info, debug]
+
+  # Uncomment to run on a schedule once the sync destination is wired up.
+  # schedule:
+  #   - cron: "0 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: batch-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Export and sync
+    runs-on: [self-hosted, linux, bee]
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          cache: true
+          go-version-file: go.mod
+
+      # `make binary` (not `make build`) is the target that emits dist/batch-export;
+      # `make build` only runs `go build ./...` and produces no artifact.
+      - name: Build
+        run: make binary
+
+      # The bare URL works from the self-hosted runners because their egress IPs
+      # are allowlisted. USER/PASSWORD are only needed off-allowlist; when they
+      # are absent the bare URL is used unchanged. Secrets are masked in logs,
+      # and the composed value is written to GITHUB_ENV rather than echoed.
+      - name: Compose endpoint
+        env:
+          RPC_URL: ${{ secrets.PRIVATE_GNOSIS_RPC_URL }}
+          RPC_USER: ${{ secrets.GNOSIS_RPC_USER }}
+          RPC_PASSWORD: ${{ secrets.GNOSIS_RPC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RPC_URL}" ]; then
+            echo "::error::PRIVATE_GNOSIS_RPC_URL is not set for this repository"
+            exit 1
+          fi
+          if [ -n "${RPC_USER}" ] && [ -n "${RPC_PASSWORD}" ]; then
+            # Insert credentials after the scheme without printing the result.
+            endpoint="$(printf '%s' "${RPC_URL}" \
+              | sed -E "s#^(https?://)#\1${RPC_USER}:${RPC_PASSWORD}@#")"
+            echo "using authenticated endpoint"
+          else
+            endpoint="${RPC_URL}"
+            echo "using unauthenticated endpoint (runner is inside the allowlist)"
+          fi
+          echo "::add-mask::${endpoint}"
+          echo "RPC_ENDPOINT=${endpoint}" >> "${GITHUB_ENV}"
+
+      - name: Export
+        run: |
+          set -euo pipefail
+          ./dist/batch-export export \
+            --endpoint "${RPC_ENDPOINT}" \
+            --start "${{ inputs.start_block }}" \
+            --end "${{ inputs.end_block }}" \
+            --max-request "${{ inputs.max_request }}" \
+            --block-range-limit "${{ inputs.block_range_limit }}" \
+            --output "${{ inputs.output }}" \
+            --verbosity "${{ inputs.verbosity }}" \
+            ${{ inputs.compress && '--compress' || '' }}
+
+      - name: Sync
+        run: |
+          echo "TODO: publish ${{ inputs.output }} to its destination."
+          exit 1
