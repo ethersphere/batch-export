@@ -1,26 +1,31 @@
 name: Batch Sync
 
-# Skeleton. The export step below is wired and runnable; the "sync" step that
-# publishes the artifact is intentionally left as a TODO — fill it in once the
-# destination is decided.
+# Resumes the postage-batch snapshot kept in ethersphere/batch-archive and
+# publishes the refreshed file back there: a commit on main plus the next
+# patch tag (vX.Y.Z -> vX.Y.Z+1).
 #
-# Runner: the self-hosted `bee` runners are inside the RPC's network allowlist,
-# so they reach the endpoint without credentials. If this is ever moved to a
-# GitHub-hosted runner, the endpoint requires HTTP Basic auth — see the
-# "Compose endpoint" step.
+# --start follows the resume cursor, --end always resolves to the latest
+# finalized block (a not-yet-finalized block can reorg, and an append-only
+# archive can never shed its logs), and a resumed .gzip stays gzip — so
+# none of the three is an input.
+#
+# Runner: the self-hosted `bee` runners sit inside the RPC's IP allowlist;
+# see "Compose endpoint" for what changes on a GitHub-hosted runner.
+#
+# Security: dispatch inputs reach run: scripts only via env — `${{ }}`
+# interpolation inside run: lets a crafted input inject shell.
+#
+# Secrets: GHA_PAT_BASIC needs contents:write on ethersphere/batch-archive;
+# PRIVATE_GNOSIS_RPC_URL is required; GNOSIS_RPC_USER / GNOSIS_RPC_PASSWORD
+# are needed only off-allowlist.
 
 on:
   workflow_dispatch:
     inputs:
-      start_block:
-        description: "Start block (0 = contract start block)"
-        required: true
-        default: "31306381"
-        type: string
-      end_block:
-        description: "End block (0 = latest)"
-        required: true
-        default: "0"
+      archive_tag:
+        description: "batch-archive tag to resume from (empty = latest)"
+        required: false
+        default: ""
         type: string
       max_request:
         description: "Max RPC requests per second"
@@ -28,20 +33,10 @@ on:
         default: "15"
         type: string
       block_range_limit:
-        description: "Max blocks per eth_getLogs query (keep low; large ranges can OOM the node)"
+        description: "Max blocks per eth_getLogs query (very large ranges can strain the node)"
         required: true
-        default: "5"
+        default: "10000"
         type: string
-      output:
-        description: "Output file path (NDJSON)"
-        required: true
-        default: "export.ndjson"
-        type: string
-      compress:
-        description: "Compress output to GZIP"
-        required: true
-        default: false
-        type: boolean
       verbosity:
         description: "Log verbosity"
         required: true
@@ -49,7 +44,7 @@ on:
         type: choice
         options: [silent, error, warn, info, debug]
 
-  # Uncomment to run on a schedule once the sync destination is wired up.
+  # Uncomment to refresh the snapshot on a schedule.
   # schedule:
   #   - cron: "0 3 * * *"
 
@@ -58,6 +53,7 @@ permissions:
 
 concurrency:
   group: batch-sync
+  # Never cancel a run that may be mid-publish of the commit and tag.
   cancel-in-progress: false
 
 jobs:
@@ -76,15 +72,45 @@ jobs:
           cache: true
           go-version-file: go.mod
 
-      # `make binary` (not `make build`) is the target that emits dist/batch-export;
-      # `make build` only runs `go build ./...` and produces no artifact.
+      # make binary (not make build) is the target that emits dist/batch-export.
       - name: Build
         run: make binary
 
-      # The bare URL works from the self-hosted runners because their egress IPs
-      # are allowlisted. USER/PASSWORD are only needed off-allowlist; when they
-      # are absent the bare URL is used unchanged. Secrets are masked in logs,
-      # and the composed value is written to GITHUB_ENV rather than echoed.
+      # Full history and tags: the latest tag is resolved locally, and the
+      # snapshot is read at the resolved tag rather than at main's HEAD.
+      - name: Checkout batch-archive
+        uses: actions/checkout@v5
+        with:
+          repository: ethersphere/batch-archive
+          token: ${{ secrets.GHA_PAT_BASIC }}
+          path: batch-archive
+          fetch-depth: 0
+
+      - name: Resolve resume point
+        env:
+          ARCHIVE_TAG_INPUT: ${{ inputs.archive_tag }}
+        run: |
+          set -euo pipefail
+          cd batch-archive
+          if [ -n "${ARCHIVE_TAG_INPUT}" ]; then
+            if ! git rev-parse -q --verify "refs/tags/${ARCHIVE_TAG_INPUT}" >/dev/null; then
+              echo "::error::tag '${ARCHIVE_TAG_INPUT}' does not exist in batch-archive"
+              exit 1
+            fi
+            archive_tag="${ARCHIVE_TAG_INPUT}"
+          else
+            archive_tag="$(git tag | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+            if [ -z "${archive_tag}" ]; then
+              echo "::error::batch-archive has no semver tag (vX.Y.Z) to resume from"
+              exit 1
+            fi
+          fi
+          echo "resuming from batch-archive tag ${archive_tag}"
+          git show "${archive_tag}:archive/export.ndjson.gzip" > ../resume.ndjson.gzip
+          echo "ARCHIVE_TAG=${archive_tag}" >> "${GITHUB_ENV}"
+
+      # Self-hosted runners are IP-allowlisted, so RPC_USER/PASSWORD are only
+      # needed off-allowlist; when unset, the bare URL is used unchanged.
       - name: Compose endpoint
         env:
           RPC_URL: ${{ secrets.PRIVATE_GNOSIS_RPC_URL }}
@@ -109,19 +135,63 @@ jobs:
           echo "RPC_ENDPOINT=${endpoint}" >> "${GITHUB_ENV}"
 
       - name: Export
+        env:
+          MAX_REQUEST: ${{ inputs.max_request }}
+          BLOCK_RANGE_LIMIT: ${{ inputs.block_range_limit }}
+          VERBOSITY: ${{ inputs.verbosity }}
         run: |
           set -euo pipefail
+          # No --end: always the latest finalized block (see header).
           ./dist/batch-export export \
             --endpoint "${RPC_ENDPOINT}" \
-            --start "${{ inputs.start_block }}" \
-            --end "${{ inputs.end_block }}" \
-            --max-request "${{ inputs.max_request }}" \
-            --block-range-limit "${{ inputs.block_range_limit }}" \
-            --output "${{ inputs.output }}" \
-            --verbosity "${{ inputs.verbosity }}" \
-            ${{ inputs.compress && '--compress' || '' }}
+            --resume resume.ndjson.gzip \
+            --output snapshot.ndjson.gzip \
+            --max-request "${MAX_REQUEST}" \
+            --block-range-limit "${BLOCK_RANGE_LIMIT}" \
+            --slim=true \
+            --verbosity "${VERBOSITY}"
 
-      - name: Sync
+      - name: Publish to batch-archive
+        env:
+          TRIGGERED_BY: ${{ github.actor }}
         run: |
-          echo "TODO: publish ${{ inputs.output }} to its destination."
-          exit 1
+          set -euo pipefail
+          cp snapshot.ndjson.gzip batch-archive/archive/export.ndjson.gzip
+          cd batch-archive
+
+          if git diff --quiet; then
+            echo "::notice::snapshot is unchanged; nothing to publish"
+            exit 0
+          fi
+
+          # blockNumber is hex ("0x...") in the slim NDJSON; the commit title
+          # uses decimal, matching the archive's history.
+          last_block_hex="$(gunzip -c archive/export.ndjson.gzip | tail -n 1 \
+            | sed -nE 's/.*"blockNumber":"(0x[0-9a-fA-F]+)".*/\1/p')"
+          if [ -z "${last_block_hex}" ]; then
+            echo "::error::could not read blockNumber from the last snapshot entry"
+            exit 1
+          fi
+          last_block="$(printf '%d' "${last_block_hex}")"
+
+          # Bump the highest existing semver tag, not the resume tag, so an
+          # older resume can't collide; non-semver tags are ignored.
+          latest_tag="$(git tag | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+          if [ -z "${latest_tag}" ]; then
+            echo "::error::batch-archive has no semver tag (vX.Y.Z) to bump"
+            exit 1
+          fi
+          IFS=. read -r major minor patch <<< "${latest_tag#v}"
+          new_tag="v${major}.${minor}.$((patch + 1))"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898470+github-actions[bot]@users.noreply.github.com"
+          git add archive/export.ndjson.gzip
+          git commit \
+            -m "chore: update snapshot to block number ${last_block}" \
+            -m "Resumed from tag ${ARCHIVE_TAG} and exported up to the latest finalized block. Triggered by @${TRIGGERED_BY} via ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          git tag "${new_tag}"
+          # --atomic: a rejected push to main rejects the tag too, so no
+          # orphaned tag can become a later run's resume point.
+          git push --atomic origin HEAD:main "refs/tags/${new_tag}"
+          echo "::notice::published snapshot at block ${last_block} as ${new_tag} (resumed from ${ARCHIVE_TAG})"
