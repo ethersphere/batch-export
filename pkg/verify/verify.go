@@ -92,8 +92,14 @@ func comparePrefix(oldR io.Reader, newR *bufio.Reader) error {
 	for {
 		n, err := oldR.Read(oldBuf)
 		if n > 0 {
-			if _, rerr := io.ReadFull(newR, newBuf[:n]); rerr != nil {
+			_, rerr := io.ReadFull(newR, newBuf[:n])
+			switch {
+			// A short new file is a mismatch; anything else is a read
+			// failure and must not be reported as if the snapshot were short.
+			case errors.Is(rerr, io.EOF), errors.Is(rerr, io.ErrUnexpectedEOF):
 				return fmt.Errorf("%w: new snapshot ends at byte %d of the old content", ErrMismatch, offset)
+			case rerr != nil:
+				return fmt.Errorf("error reading new snapshot: %w", rerr)
 			}
 			if !bytes.Equal(oldBuf[:n], newBuf[:n]) {
 				return fmt.Errorf("%w: content diverges within bytes %d..%d of the old content", ErrMismatch, offset, offset+int64(n))
@@ -130,6 +136,9 @@ func checkTail(r *bufio.Reader, prev *resume.Cursor) (int, error) {
 		case errors.Is(err, bufio.ErrBufferFull):
 			continue
 		case errors.Is(err, io.EOF):
+			// Defensive: Verify rejects a truncated new file up front, and a
+			// clean gzip member ending mid-line is already refused by
+			// resume.Read, so this should be unreachable in practice.
 			if len(line) > 0 {
 				return 0, fmt.Errorf("appended line %d ends without a newline", lineNum+1)
 			}

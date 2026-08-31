@@ -152,10 +152,18 @@ jobs:
             --verbosity "${VERBOSITY}"
 
       # A failed verification stops the job before any commit or tag exists.
+      #
+      # --old is the file Publish overwrites (main's current archive), not the
+      # resumed tag: a non-tip archive_tag plus a stale finalized head could
+      # otherwise verify clean against the tag while still losing entries main
+      # already has. Identical to the resumed tag in the normal case (resumed
+      # tag == main's tip), so this is a no-op then. An archive version
+      # written before the slim format would fail closed here, which is the
+      # intended answer.
       - name: Verify snapshot
         run: |
           set -euo pipefail
-          last_block="$(./dist/batch-export verify --old resume.ndjson.gzip --new snapshot.ndjson.gzip)"
+          last_block="$(./dist/batch-export verify --old batch-archive/archive/export.ndjson.gzip --new snapshot.ndjson.gzip)"
           echo "LAST_BLOCK=${last_block}" >> "${GITHUB_ENV}"
 
       - name: Publish to batch-archive
@@ -166,6 +174,9 @@ jobs:
           cp snapshot.ndjson.gzip batch-archive/archive/export.ndjson.gzip
           cd batch-archive
 
+          # Cannot fire today: a resumed gzip export always appends a ~20-byte
+          # empty gzip member even when zero new logs were fetched, so the
+          # file always differs. Kept in case that stops being true.
           if git diff --quiet; then
             echo "::notice::snapshot is unchanged; nothing to publish"
             exit 0

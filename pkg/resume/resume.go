@@ -438,13 +438,14 @@ func ParseEntry(line []byte) (*Cursor, error) {
 	return parseCursor(line)
 }
 
-// OpenClean returns the decompressed clean content of the export at path —
-// the same bytes PrepareOutput would carry over. c must come from Read on
-// the same, unmodified file.
+// OpenClean returns the decompressed form of the clean content at path — the
+// same content PrepareOutput carries over, but decompressed rather than
+// PrepareOutput's raw copy. c must come from Read on the same, unmodified
+// file.
 func OpenClean(path string, c *Cursor) (io.ReadCloser, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("error opening export file: %w", err)
+		return nil, fmt.Errorf("error opening resume file: %w", err)
 	}
 
 	limited := io.LimitReader(file, c.CleanSize)
@@ -455,7 +456,7 @@ func OpenClean(path string, c *Cursor) (io.ReadCloser, error) {
 	gz, err := gzip.NewReader(bufio.NewReaderSize(limited, bufferSize))
 	if err != nil {
 		file.Close()
-		return nil, fmt.Errorf("error reading gzip export file: %w", err)
+		return nil, fmt.Errorf("error reading gzip resume file: %w", err)
 	}
 
 	return &cleanReader{Reader: gz, closer: file}, nil

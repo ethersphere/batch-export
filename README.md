@@ -125,7 +125,7 @@ byte for byte, in order — followed only by newer entries, and prints the new
 snapshot's last block number in decimal:
 
 ```sh
-batch-export verify --old export.ndjson.gzip --new snapshot.ndjson.gzip
+./dist/batch-export verify --old export.ndjson.gzip --new snapshot.ndjson.gzip
 ```
 
 A non-zero exit means the new snapshot must not replace the old one.
