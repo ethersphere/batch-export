@@ -152,6 +152,8 @@ jobs:
             --verbosity "${VERBOSITY}"
 
       - name: Publish to batch-archive
+        env:
+          TRIGGERED_BY: ${{ github.actor }}
         run: |
           set -euo pipefail
           cp snapshot.ndjson.gzip batch-archive/archive/export.ndjson.gzip
@@ -187,7 +189,7 @@ jobs:
           git add archive/export.ndjson.gzip
           git commit \
             -m "chore: update snapshot to block number ${last_block}" \
-            -m "Resumed from tag ${ARCHIVE_TAG} and exported up to the latest finalized block by the Batch Sync workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            -m "Resumed from tag ${ARCHIVE_TAG} and exported up to the latest finalized block. Triggered by @${TRIGGERED_BY} via ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           git tag "${new_tag}"
           # --atomic: a rejected push to main rejects the tag too, so no
           # orphaned tag can become a later run's resume point.
