@@ -118,6 +118,18 @@ touched — delete the incomplete `--output` file and rerun.
 
 The produced NDJSON is consumed by [batch-archive](https://github.com/ethersphere/batch-archive), which embeds it for use inside Bee.
 
+### Verifying a snapshot
+
+`verify` proves a refreshed snapshot still holds everything the original did —
+byte for byte, in order — followed only by newer entries, and prints the new
+snapshot's last block number in decimal:
+
+```sh
+./dist/batch-export verify --old export.ndjson.gzip --new snapshot.ndjson.gzip
+```
+
+A non-zero exit means the new snapshot must not replace the old one.
+
 ## Maintainers
 
 - [Bee](https://github.com/orgs/ethersphere/teams/bee) team
